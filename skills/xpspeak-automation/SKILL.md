@@ -1,0 +1,128 @@
+---
+name: xpspeak-automation
+description: 用 AI/脚本控制 XPSPeak 4.1（XPSPEAK41.exe，XPS 分峰软件）——Win32 消息级自动化 + 自带 MCP server，可装到新电脑、载入谱图、加分峰/扣背景/优化、导出数据与原生 .xps/.rpa。触发词：XPSPeak / XPSPEAK41 / XPS 分峰 / 控制 XPS Peak / 把 XPS 分峰装到别的电脑 / 让 AI 操作 XPS 分峰软件。
+---
+
+# XPSPeak 4.1 自动化：怎么控制它 + 怎么装到别的电脑
+
+本目录同时是**技能**和**MCP server**：SKILL.md 给 AI 看怎么用，两个 .py 是真干活的（纯标准库，无第三方依赖）。
+
+- \`xpspeak_mcp.py\` — MCP server（stdio，7 个工具），任何 MCP 客户端（DSH / Claude Code / Cursor…）都能调
+- \`xpspeak_drive.py\` — 底层 Win32 消息驱动，也可以**不装 MCP 直接用命令行跑**
+
+---
+
+## 一、XPSPEAK41 能怎么控制（选型，别绕远路）
+
+| 方式 | 可行性 | 结论 |
+|---|---|---|
+| **Win32 消息级自动化**（本技能）| ★★★★★ | **首选**。XPSPeak 是 VB6 程序（表单类 \`ThunderRT6FormDC\`，按钮 \`ThunderRT6CommandButton\`），菜单是**真 Win32 菜单** → 可以按菜单**文字**取 id，然后 \`PostMessage WM_COMMAND\`。不依赖鼠标坐标、DPI、前台焦点，用户在别的窗口打字也不影响 |
+| UI Automation / pywinauto | ★★ | VB6 老控件属性暴露极少，反而更绕；还要装第三方库 → 不用 |
+| 键鼠模拟（SendInput / 按键精灵 / AutoHotkey）| ★★ | 必须前台 + 固定坐标 + 固定缩放；用户碰一下鼠标就崩 → 只在乱套时兜底 |
+| 命令行 / 批处理 | ✗ | XPSPEAK41.exe **没有 CLI**（Readme 里无此说明，实测不带参数启动）；只有 GUI |
+| 文件层 | ★★★★ | 数据进出走 ASCII（\`Data > Import (ASCII)\` / \`Export (Spectrum)\`）和原生 \`.xps\` / \`.rpa\`。**真要批量分峰，用 Python 自己拟合更靠谱**；XPSPeak 用来人工看/存参数/出图 |
+
+一句话：**要 AI 驱动 → MCP + Win32 消息；只想自己点 → 直接开程序。**
+
+---
+
+## 二、装到另一台电脑
+
+### 第 0 步（最快）：一条命令
+从 GitHub 拿到仓库后，在仓库根目录：
+
+    python install.py
+
+它自动做完「拷文件到技能库 → 找 XPSPEAK41.exe → 打印可直接导入的 mcpServers JSON」，下面第 1、2 步就不用手工了（\`--exe/--dest/--json-only\` 可覆盖；同目录会落一份 \`mcpServers.json\`）。
+
+> **不能只给一个 GitHub 链接就装进 MCP**：本 MCP 驱动的是本机 GUI，必须是本机 stdio 进程，不像连接器市场里的托管服务（DSH 市场 109 条全是 \`streamable-http\`）那样给 URL 即可。所以「GitHub 拿代码 + 本机一条命令注册」是另一台机器上最短的路。
+
+### 前提
+- Windows（必须；XPSPeak 只有 Windows 版），已装好 XPSPeak 4.1（\`XPSPEAK41.exe\`）
+- Python 3.8+（**标准库就够**，不需要 pip 装任何东西；DSH 自带 runtime 的 python.exe 也能用）
+
+### 第 1 步：放文件（整个目录一起拷）
+把 \`xpspeak-automation/\`（含 SKILL.md + 两个 .py）拷到一个**固定不变**的目录，推荐：
+
+    %USERPROFILE%\.agents\skills\xpspeak-automation\
+
+放这儿的好处：DSH 的技能库就是扫这个目录，拷一次 = **技能和 MCP 一起装好**。
+（其它客户端没有技能库就放任意固定目录，例如 \`D:\tools\xpspeak-automation\`。）
+记这个目录为 **\<DIR\>**。
+
+### 第 2 步：注册 MCP server
+**DSH**：把下面 JSON 交给 \`mcp_connector_import_json\`（或 UI：设置 → MCP/连接器 → 添加自定义 stdio），把两个 \`<...>\` 换成真实路径，**JSON 里的反斜杠要写两个** \`\\\`：
+
+~~~json
+{"mcpServers":{"xpspeak":{"command":"<PYTHON.exe 绝对路径>","args":["<DIR>\\xpspeak_mcp.py"],"env":{"XPSPEAK_EXE":"<XPSPEAK41.exe 绝对路径>"}}}}
+~~~
+
+**其它客户端**（Claude Code / Cursor / Cherry Studio…）写进各自的 \`mcpServers\`，形状同上。
+
+> \`XPSPEAK_EXE\` 是**必须按机器改的旋钮**：代码里的默认路径是作者机器的，别的机器一定不一样。
+> 不想写 env 也行 —— 但必须在启动前设好同名环境变量，否则会报 “请设环境变量 XPSPEAK_EXE”。
+
+### 第 3 步：自检（会真开一次 XPSPeak，约 12 秒）
+
+    "<PYTHON.exe>" "<DIR>\xpspeak_mcp.py" --selftest
+
+期望输出：\`selftest OK: 7 个工具，initialize/tools-list/status/open/save/export/close 全通，导出 N 字节、存 .xps M 字节\`。
+自检用安装包自带的样例谱 \`gaas.xps\`（与 XPSPEAK41.exe 同目录）。若没有，把 XPSPEAK41.exe 旁边的任意 .xps 拷成 \`gaas.xps\` 即可。
+
+### 第 4 步：重启客户端
+MCP 配置**必须重启客户端才生效**。重启后先调 \`xpspeak_status\`，能看到 pid + 按钮 + 菜单清单就算通了。
+
+### 磁盘/离线替代
+不想装 MCP 也能用，直接命令行：
+
+    python xpspeak_drive.py inventory                    # 打印窗口/菜单/控件清单（排查用）
+    python xpspeak_drive.py export <in.xps> <out.dat>    # 打开谱图 → 导出 ASCII
+    python xpspeak_drive.py importascii <in.txt> <out.dat>
+
+---
+
+## 三、工具与调用顺序
+
+先 \`xpspeak_status\`（未运行会自动拉起 XPSPeak）→ \`xpspeak_open\` 载谱 → 用 \`xpspeak_menu\`/\`xpspeak_click\` 做分峰 → \`xpspeak_export\` 出数据 / \`xpspeak_save\` 存状态 → 需要时 \`xpspeak_close\`。
+
+| 工具 | 干什么 | 关键参数 |
+|---|---|---|
+| \`xpspeak_status\` | 启动并返回 pid、窗体、按钮、全部菜单项。**任何操作前先调它** | — |
+| \`xpspeak_open\` | 载入谱图 | \`path\`；\`source\`=auto/xps/ascii（auto 按扩展名：.xps/.rpa 走 Open XPS，其余走 Import (ASCII)） |
+| \`xpspeak_export\` | 导出数据 | \`path\`；\`what\`=spectrum（B.E./Raw/Peak Sum/Background/各峰/difference）或 peaks（峰参数表） |
+| \`xpspeak_save\` | 存原生文件 | \`path\`；\`what\`=xps（谱图+背景+已定峰，可被 open 原样载回）或 rpa（只存区域峰参数，可套到别的谱） |
+| \`xpspeak_menu\` | 执行任意菜单 | \`top\`（Data / Parameters / Add Peak / Background / Optimise Region / ReDisplay），\`sub\`，\`settle\`（等待秒数，默认 2） |
+| \`xpspeak_click\` | 按标题点按钮 | \`caption\`（Open XPS / Save XPS / Optimise All / Close / Options / 区域号 1..10），\`form\`=processing/fit |
+| \`xpspeak_close\` | 关进程 | — |
+
+菜单可用项：\`Data > Export (Spectrum) / Export (Peak Parameters) / Import (ASCII) / Import (Kratos|Leybold|Phi|VAMAS)\`；
+\`Parameters > Load|Save Region Parameters / Clear Parameters / Delete Region / Region Shift\`；
+顶层直接是命令：\`Add Peak\` / \`Background\` / \`Optimise Region\` / \`ReDisplay\`。
+
+---
+
+## 四、实测坑（照抄，都是真机踩过的）
+
+1. **必须 \`PostMessage\`，不能 \`SendMessage\`**：BM_CLICK / IDOK 用 SendMessage 会同步等到模态框关闭，遇到异常弹窗直接死锁。
+2. **文件对话框填 Edit 再发 IDOK**，不要去点按钮 HWND：Open 对话框的按钮在 DirectUI 里根本没有 HWND（Save 对话框才有 Button id=1）。Edit 的 CtrlID 是 \`0x47C\`(=1148) 或 \`1001\`。
+3. **传给文件对话框的路径必须是反斜杠形式**（\`C:\a\b.dat\`）：正斜杠会被 Save 对话框拒绝 → 对话框不关、文件写不出来。
+4. **Import (ASCII) 只认 CRLF**：LF-only 文件会被**静默读错**（实测 181 点读成 91 点、B.E. 列变成强度值）。驱动里的 \`ascii_crlf()\` 会自动做一份 CRLF 副本。
+5. **导出成功会弹 “XPSPEAK41 / Data file exported” 模态框**，要顺手点掉才能继续；这类框的确定按钮 **CtrlID=2**，\`WM_COMMAND IDOK(1)\` 打不掉，必须 \`BM_CLICK\` 真按钮。
+6. **Processing 窗的 “Save XPS” 保存框标题仍然是 “Open file”**（VB6 CommonDialog 的 caption 没改）—— 按标题匹配时别写错。
+7. **分峰窗标题会随区域改名**（载入后从 “XPS Peak Fit” 变 “Region 4”）→ 认窗只能靠「有菜单」，不能靠标题。
+8. **启动到窗体可用约 4 秒**，驱动里轮询最多 20×0.5 秒等它出现，别刚 Popen 就操作。
+9. **stdio 协议纪律**：stdout 只许写 JSON-RPC 行，工具里的 print 全部重定向到 stderr；stdin/stdout 必须 \`reconfigure(encoding="utf-8")\`（Windows 管道默认 cp936，不设会中文乱码/解码失败）。
+10. 已经有人开着 XPSPeak 也能接管（\`find_pid\` 找现有窗口），不会另开一个；\`xpspeak_close\` 是 \`taskkill /F\`。
+
+---
+
+## 五、排障
+
+| 现象 | 处理 |
+|---|---|
+| \`FileNotFoundError\` / “请设环境变量 XPSPEAK_EXE” | 路径不对。设 \`XPSPEAK_EXE\` 指向真实的 XPSPEAK41.exe（env 或系统环境变量） |
+| 工具调用超时/卡住 | 别用 SendMessage 类操作；看有没有没点掉的模态框（\`_kill_strays\` 就是干这个的） |
+| 导出的文件不存在但工具说成功 | 路径写成正斜杠了；或者 Save 对话框没关。检查路径 + 重试 |
+| 载入后点数少一半 / X 列变成强度 | ASCII 是 LF 换行，走 \`xpspeak_open\`（自动 CRLF 化）而不是自己喂给程序 |
+| 菜单命令没反应 | 菜单文字写错（区分 \`Export (Spectrum)\` 与 \`Export (Peak Parameters)\`）；用 \`xpspeak_status\` 打印的菜单清单核对 |
+| 客户端里看不到工具 | 配置 JSON 语法错（反斜杠没转义）+ **没重启客户端** |
