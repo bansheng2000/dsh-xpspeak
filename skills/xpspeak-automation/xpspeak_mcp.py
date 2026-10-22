@@ -12,10 +12,11 @@
 
 注意: 本进程只许往 stdout 写协议行，工具里的任何 print 都重定向到 stderr。
 """
-import contextlib, ctypes, ctypes.wintypes, json, os, sys, time
+import contextlib, ctypes, ctypes.wintypes, json, math, os, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import xpspeak_drive as D
+import xps_fit as F          # 带约束拟合（纯 Python，不需要 GUI，见 xps_fit.py 顶部说明）
 
 EXE = os.environ.get("XPSPEAK_EXE", D.EXE_DEFAULT)
 PROTO = "2024-11-05"
@@ -154,7 +155,27 @@ def do_save(path, what="xps"):
     return "已保存 %s（%d 字节，文件头 %r）" % (path, os.path.getsize(path), head)
 
 
+def do_fit(a):
+    """一次调用完成「拟合 -> 参数±σ -> 优度 -> 可选曲线 CSV」，不启动 GUI。
+
+    XPSPeak 的 Optimise 是无约束优化（实测会把 2p1/2 压成面积 1/6，物理上错误），
+    所以「要可发表的结果」必须走这里；GUI 只用于人工看/交付 .xps。"""
+    res = F.run(a["path"], [float(c) for c in a["centers"]], a.get("bg", "file"),
+                int(a.get("bg_col", 4)), float(a.get("ds", 1.18)),
+                float(a.get("ratio", 0.5)), float(a.get("eta", 0.3)),
+                a.get("csv"), int(a.get("scan", 0)))
+    txt = F.report(res, head="文件: %s" % a["path"])
+    for k in sorted(k for k in res if k.startswith("scan")):
+        s = res[k]
+        txt += "\n  对照 %s 条双线: rms=%.1f  AIC=%.1f  R²=%.6f" % (s["nc"], s["rms"], s["aic"], s["r2"])
+    if a.get("csv"):
+        txt += "\n曲线已写入: %s" % a["csv"]
+    return txt
+
+
 def do_call(name, a):
+    if name == "xpspeak_fit":
+        return do_fit(a)
     if name == "xpspeak_status":
         return do_status()
     if name == "xpspeak_open":
@@ -185,6 +206,18 @@ def do_call(name, a):
 
 
 TOOLS = [
+    ("xpspeak_fit", "带约束的多峰双线拟合（纯 Python，毫秒级，不启动 GUI）。输入 XPSPeak 导出的谱图（BE/Raw/.../Background）或两列 ASCII，返回每条组分的 center/FWHM/面积±σ、rms、R²、AIC，可一次扫 1..N 条模型做对比。约束内建：自旋轨道劈裂 Δ 固定、面积比固定、双峰等宽 —— 这就是可发表的版本；XPSPeak 自带的 Optimise 是无约束的，会把伴线压到物理上错误的宽度，别用它出结论。",
+     {"path": dict(S, description="谱图文件绝对路径（XPSPeak 导出的 .dat 或两列 BE+Intensity）"),
+      "centers": {"type": "array", "items": {"type": "number"},
+                  "description": "各组分主峰初值（eV，低结合能那条），如 [162.09]；多条如 [162.09, 167.6]"},
+      "bg": {"type": "string", "enum": ["file", "linear", "shirley", "none"],
+             "description": "背景来源：file=用文件自带背景列（默认，最稳）；linear/shirley=自己算；none=不扣"},
+      "bg_col": {"type": "number", "description": "背景列序号（1 起），默认 4"},
+      "ds": {"type": "number", "description": "自旋轨道劈裂 ΔBE（eV）：S 2p=1.18，其他元素按文献值，默认 1.18"},
+      "ratio": {"type": "number", "description": "伴线/主峰面积比，2p=0.5，d 轨道=2/3，默认 0.5"},
+      "eta": {"type": "number", "description": "%Lorentzian（0-1），默认 0.3"},
+      "scan": {"type": "number", "description": "同时扫 1..N 条双线做 AIC 对比（N ≤ centers 个数）"},
+      "csv": dict(S, description="可选：把 BE/Signal/Fit/Resid 曲线写到这个 CSV")}, ["path", "centers"]),
     ("xpspeak_status", "启动（若未运行）并返回 XPSPeak 进程号、窗体、按钮和全部菜单项。任何操作前先调它。", {}, []),
     ("xpspeak_open", "载入谱图。source=auto 按扩展名判断（.xps/.rpa 走 Open XPS，其余走 Data>Import (ASCII)，ASCII 若是 LF 换行会自动改用 CRLF 副本）。",
      {"path": dict(S, description="谱图文件绝对路径（.xps / .rpa / 两列 BE+Intensity 的 ASCII）"),
@@ -212,7 +245,7 @@ def handle(req):
         return {"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": req.get("params", {}).get("protocolVersion") or PROTO,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "xpspeak", "version": "0.1.0"}}}
+            "serverInfo": {"name": "xpspeak", "version": "0.2.0"}}}
     if m == "tools/list":
         return {"jsonrpc": "2.0", "id": rid, "result": {"tools": [
             {"name": n, "description": d,
@@ -273,7 +306,22 @@ def selftest():
     ini = rpc("initialize", {"protocolVersion": PROTO})
     assert ini["result"]["serverInfo"]["name"] == "xpspeak", ini
     names = [t["name"] for t in rpc("tools/list")["result"]["tools"]]
-    assert len(names) == 7 and "xpspeak_export" in names and "xpspeak_save" in names, names
+    assert len(names) == 8 and "xpspeak_export" in names and "xpspeak_save" in names, names
+    # 不依赖 GUI 的拟合自检：合成一条双峰谱，验证 xpspeak_fit 能把峰位/半宽拟合回来
+    syn = os.path.join(tempfile.gettempdir(), "xpspeak_fit_check.dat")
+    with open(syn, "w", encoding="utf-8") as fh:
+        fh.write("BE Raw PeakSum Background\n")
+        for i in range(121):
+            e = 175.0 - 0.1 * i
+            fh.write("%.4f %.2f %.2f %.2f\n" % (e, 3000 + F.model_at(e, [163.0, 1.0, 200.0], 1, 0.0, 0.0, 0.3),
+                                                 3000.0, 3000.0))
+    fr = rpc("tools/call", {"name": "xpspeak_fit",
+                            "arguments": {"path": syn, "centers": [163.05], "bg": "file",
+                                          "ds": 0.0, "ratio": 0.0, "eta": 0.3}})
+    assert not fr["result"].get("isError"), fr
+    txt = fr["result"]["content"][0]["text"]
+    assert "162.9" in txt or "163.0" in txt, txt
+    os.remove(syn)
     st = rpc("tools/call", {"name": "xpspeak_status", "arguments": {}})
     assert "pid=" in st["result"]["content"][0]["text"], st
     sample = os.path.join(os.path.dirname(EXE), "gaas.xps")
@@ -296,7 +344,7 @@ def selftest():
     pr.wait(timeout=10)
     assert size > 1000, "导出不到 1KB: %d" % size
     assert saved > 1000 and head.startswith(b"XPSPEAK"), "存 .xps 异常: %d %r" % (saved, head)
-    print("selftest OK: %d 个工具，initialize/tools-list/status/open/save/export/close 全通，导出 %d 字节、存 .xps %d 字节"
+    print("selftest OK: %d 个工具，initialize/tools-list/fit/status/open/save/export/close 全通，导出 %d 字节、存 .xps %d 字节"
           % (len(names), size, saved))
 
 

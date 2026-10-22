@@ -4,7 +4,7 @@
 
 - 纯标准库 Python，**零依赖**：不需要 pywin32 / pywinauto / UIAutomation
 - 走 **Win32 消息级自动化**（按菜单文字取 id → \`PostMessage WM_COMMAND\`），不抢鼠标、不抢前台焦点、和 DPI/分辨率无关
-- 自带 MCP server（stdio，7 个工具），DSH / Claude Code / Cursor 等任何 MCP 客户端都能用；也可以不装 MCP 直接命令行跑
+- 自带 MCP server（stdio，8 个工具），DSH / Claude Code / Cursor 等任何 MCP 客户端都能用；也可以不装 MCP 直接命令行跑
 
 ## 文件
 
@@ -12,6 +12,7 @@
     skills/xpspeak-automation/SKILL.md           安装手册 + 控制方式选型 + 10 条实测坑
     skills/xpspeak-automation/xpspeak_mcp.py     MCP server（stdio）
     skills/xpspeak-automation/xpspeak_drive.py   Win32 消息驱动（也可独立当 CLI）
+    skills/xpspeak-automation/xps_fit.py         带约束的分峰拟合（纯 Python，毫秒级，不碰 GUI）
 
 ## 安装
 
@@ -51,6 +52,17 @@ DSH 用 \`mcp_connector_import_json\` 粘贴这段即可；其它客户端写进
 - Windows + 已安装 XPSPeak 4.1（\`XPSPEAK41.exe\`）
 - Python 3.8+，标准库即可
 - \`XPSPEAK_EXE\` 指向本机的 XPSPEAK41.exe（不同机器路径不同，这是唯一需要改的旋钮）
+
+## 分峰：用 `xpspeak_fit`，别用 GUI 的 Optimise
+
+XPSPeak 4.1 的 Optimise 是**无约束**优化：实测把 MoS₂/S 2p 跑成 2p₁/₂ 面积只有主峰的 1/6、FWHM 比主峰还窄（物理上不可能），而且它把曲线数组存在 `.xps` 里，改参数不会重算曲线。
+
+`xpspeak_fit` 用参数化内建约束（自旋轨道劈裂 Δ 固定、面积比固定、双峰等宽），毫秒级出 center/FWHM/面积±σ + rms/R²/AIC，还能一次扫 1..N 条模型做 AIC 对比：
+
+    python skills/xpspeak-automation/xps_fit.py out/mos_s2p_export.dat --centers 162.09 --bg file
+    python skills/xpspeak-automation/xps_fit.py out/mos_s2p_export.dat --centers 162.09,167.6,169.2 --bg file --scan 3
+
+回归基准（MoS₂/S 2p，181 点）：162.059±0.003 eV、FWHM 0.952±0.006、area 80944±518、rms 577.4、R² 0.996822、AIC 2307.8。
 
 ## 为什么不用 pywinauto / 键鼠脚本
 

@@ -5,7 +5,7 @@ description: 用 AI/脚本控制 XPSPeak 4.1（XPSPEAK41.exe，XPS 分峰软件�
 
 # XPSPeak 4.1 自动化：怎么控制它 + 怎么装到别的电脑
 
-本目录同时是**技能**和**MCP server**：SKILL.md 给 AI 看怎么用，两个 .py 是真干活的（纯标准库，无第三方依赖）。
+本目录同时是**技能**和**MCP server**：SKILL.md 给 AI 看怎么用，三个 .py 是真干活的（纯标准库，无第三方依赖）。
 
 - \`xpspeak_mcp.py\` — MCP server（stdio，7 个工具），任何 MCP 客户端（DSH / Claude Code / Cursor…）都能调
 - \`xpspeak_drive.py\` — 底层 Win32 消息驱动，也可以**不装 MCP 直接用命令行跑**
@@ -98,6 +98,14 @@ MCP 配置**必须重启客户端才生效**。重启后先调 \`xpspeak_status\
 菜单可用项：\`Data > Export (Spectrum) / Export (Peak Parameters) / Import (ASCII) / Import (Kratos|Leybold|Phi|VAMAS)\`；
 \`Parameters > Load|Save Region Parameters / Clear Parameters / Delete Region / Region Shift\`；
 顶层直接是命令：\`Add Peak\` / \`Background\` / \`Optimise Region\` / \`ReDisplay\`。
+
+### 分峰：为什么用 `xpspeak_fit` 而不是 GUI 的 Optimise
+
+- **Optimise 是无约束的**：实测 MoS₂/S 2p 跑成 162.031（area 69065）+ 163.086（area 11464, FWHM 2.125）——2p₁/₂ 面积只有 1/6、还比主峰窄，物理上不可能；rms 反而更低（444 cps），是"约束缺失被噪声利用"。
+- **XPSPeak 把曲线数组存在文件里**，参数只是显示值：改参数不会重算曲线 → 自造 .xps 会出现「参数和曲线对不上」的误导性文件。要交付 .xps 就打开原文件手工填数值，**别再点 Optimise**。
+- `xpspeak_fit` 把约束做进参数化（Δ 固定、面积比固定、双峰等宽），只放 center/FWHM/height —— 这就是可发表版本；放开约束的结果可作为系统误差上界。
+
+回归基准（MoS₂/S 2p，181 点，背景用文件自带 Shirley）：162.059±0.003 eV、FWHM 0.952±0.006、area 80944±518、rms 577.4、R² 0.996822、AIC 2307.8；2/3 条双线对照 543.5/2291.9、506.9/2272.7（追加组分 FWHM 撞上界 → 判为无新化学态）。
 
 ---
 

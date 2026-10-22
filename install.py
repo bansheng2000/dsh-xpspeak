@@ -15,7 +15,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "skills", "xpspeak-automation")
-FILES = ["SKILL.md", "xpspeak_mcp.py", "xpspeak_drive.py"]
+FILES = ["SKILL.md", "xpspeak_mcp.py", "xpspeak_drive.py", "xps_fit.py"]
 SKIP_DIRS = {"windows", "$recycle.bin", "system volume information", "node_modules", ".git"}
 
 
