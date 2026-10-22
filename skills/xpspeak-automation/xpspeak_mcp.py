@@ -173,9 +173,70 @@ def do_fit(a):
     return txt
 
 
+def _spec_areas(path):
+    """从导出的谱图里量出每条分峰的面积（梯形积分 (Peak_i - Background)）。
+    纯标准库：这份文件就是 .xps 里存的那条曲线，量它等于量交付物本身。"""
+    rows = []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        f.readline()
+        for ln in f:
+            t = ln.split()
+            if len(t) >= 5:
+                try:
+                    rows.append([float(v) for v in t])
+                except ValueError:
+                    pass
+    if len(rows) < 3:
+        return []
+    rows.sort(key=lambda r: -r[0])
+    out = []
+    for i in range(len(rows) - 1):
+        a, b = rows[i], rows[i + 1]
+        step = abs(a[0] - b[0])
+        for j in range(4, len(a)):
+            if j >= len(b):
+                break
+            if len(out) <= j - 4:
+                out.append(0.0)
+            out[j - 4] += (a[j] - a[3] + b[j] - b[3]) / 2.0 * step
+    return out
+
+
+def do_build(a):
+    """一次调用把一组峰参数落成可交付的 .xps（不需要人点 GUI）。
+
+    与「先造 .rpa 再 Load Region Parameters」的区别：那条路首峰 Area 会被软件按 height 反算忽略，
+    生成曲线比参数小约 25%；走 Add Peak 对话框则 Area 被真正采用（实测面积吻合）。"""
+    peaks = a["peaks"]
+    if not peaks:
+        raise ValueError("peaks 不能为空")
+    out = os.path.normpath(a.get("out") or os.path.join(D.WORKDIR, "built.xps"))
+    spec = os.path.normpath(a["spec"]) if a.get("spec") else None
+    par = os.path.normpath(a["par"]) if a.get("par") else None
+    r = D.build(EXE, a["path"], peaks, out, spec, par, a.get("bg"))
+    txt = "已生成 %s（%d 字节）" % (r["xps"], r["xps_bytes"])
+    if spec:
+        txt += "\n谱图 %s" % spec
+    if par:
+        txt += "\n参数 %s" % par
+    if spec:
+        got = _spec_areas(spec)
+        for i, pk in enumerate(r["peaks"]):
+            want = pk["area"]
+            if i < len(got):
+                txt += "\n  峰%d  %8.3f eV  FWHM %.3f  面积 要求 %.0f / 实测 %.0f  (%+.1f%%)" % (
+                    i + 1, pk["pos"], pk["fwhm"], want, got[i], 100.0 * (got[i] / want - 1.0))
+            else:
+                txt += "\n  峰%d  %8.3f eV  FWHM %.3f  面积 %.0f（谱图里没找到对应峰列）" % (
+                    i + 1, pk["pos"], pk["fwhm"], want)
+    return txt
+
+
 def do_call(name, a):
     if name == "xpspeak_fit":
         return do_fit(a)
+    if name == "xpspeak_build":
+        return do_build(a)
     if name == "xpspeak_status":
         return do_status()
     if name == "xpspeak_open":
@@ -218,6 +279,20 @@ TOOLS = [
       "eta": {"type": "number", "description": "%Lorentzian（0-1），默认 0.3"},
       "scan": {"type": "number", "description": "同时扫 1..N 条双线做 AIC 对比（N ≤ centers 个数）"},
       "csv": dict(S, description="可选：把 BE/Signal/Fit/Resid 曲线写到这个 CSV")}, ["path", "centers"]),
+    ("xpspeak_build", "一次调用生成可交付的 .xps：载谱 -> 扣背景 -> 按给定峰参数逐个 Add Peak -> 导出谱图/参数 -> Save XPS，全程不用人点界面，并回读谱图复核每峰面积。典型用法：先 xpspeak_fit 出可发表参数，再用本工具把同一组参数落成 XPSPeak 原生文件（给人工看/存档/交付）。注意别用「造 .rpa 再 Load Region Parameters」那条路：实测首峰 Area 会被软件按 height 反算忽略，曲线比参数小约 25%。",
+     {"path": dict(S, description="源谱图绝对路径（两列 ASCII 或 .xps）"),
+      "peaks": {"type": "array", "description": "分峰参数，按顺序 Add Peak",
+                "items": {"type": "object", "properties": {
+                    "pos": {"type": "number", "description": "峰位 eV"},
+                    "fwhm": {"type": "number", "description": "半高宽 eV"},
+                    "area": {"type": "number", "description": "面积（会被真正采用）"},
+                    "gl": {"type": "number", "description": "%Lorentzian，默认 30"}},
+                    "required": ["pos", "fwhm", "area"]}},
+      "out": dict(S, description="输出 .xps 绝对路径；省略则写 ~/xpspeak_auto/built.xps"),
+      "spec": dict(S, description="可选：同时导出谱图 ASCII 到这个路径（用于复核面积）"),
+      "par": dict(S, description="可选：同时导出峰参数表到这个路径"),
+      "bg": {"type": "boolean", "description": "是否先扣背景建区域；ASCII 源默认 true，.xps 源默认 false"}},
+     ["path", "peaks"]),
     ("xpspeak_status", "启动（若未运行）并返回 XPSPeak 进程号、窗体、按钮和全部菜单项。任何操作前先调它。", {}, []),
     ("xpspeak_open", "载入谱图。source=auto 按扩展名判断（.xps/.rpa 走 Open XPS，其余走 Data>Import (ASCII)，ASCII 若是 LF 换行会自动改用 CRLF 副本）。",
      {"path": dict(S, description="谱图文件绝对路径（.xps / .rpa / 两列 BE+Intensity 的 ASCII）"),
@@ -245,7 +320,7 @@ def handle(req):
         return {"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": req.get("params", {}).get("protocolVersion") or PROTO,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "xpspeak", "version": "0.2.0"}}}
+            "serverInfo": {"name": "xpspeak", "version": "0.3.0"}}}
     if m == "tools/list":
         return {"jsonrpc": "2.0", "id": rid, "result": {"tools": [
             {"name": n, "description": d,
@@ -306,7 +381,7 @@ def selftest():
     ini = rpc("initialize", {"protocolVersion": PROTO})
     assert ini["result"]["serverInfo"]["name"] == "xpspeak", ini
     names = [t["name"] for t in rpc("tools/list")["result"]["tools"]]
-    assert len(names) == 8 and "xpspeak_export" in names and "xpspeak_save" in names, names
+    assert len(names) == 9 and "xpspeak_build" in names and "xpspeak_save" in names, names
     # 不依赖 GUI 的拟合自检：合成一条双峰谱，验证 xpspeak_fit 能把峰位/半宽拟合回来
     syn = os.path.join(tempfile.gettempdir(), "xpspeak_fit_check.dat")
     with open(syn, "w", encoding="utf-8") as fh:
@@ -339,13 +414,26 @@ def selftest():
     head = open(xps, "rb").read(12) if saved else b""
     if saved:
         os.remove(xps)
+    bspec = os.path.join(tempfile.gettempdir(), "xpspeak_build_check.dat")
+    bxps = os.path.join(tempfile.gettempdir(), "xpspeak_build_check.xps")
+    br = rpc("tools/call", {"name": "xpspeak_build", "arguments": {
+        "path": sample, "peaks": [{"pos": 40.0, "fwhm": 1.2, "area": 5000.0}],
+        "out": bxps, "spec": bspec}})
+    assert not br["result"].get("isError"), br
+    btxt = br["result"]["content"][0]["text"]
+    assert "实测" in btxt, btxt
+    built = os.path.getsize(bxps) if os.path.exists(bxps) else 0
+    for f in (bspec, bxps):
+        if os.path.exists(f):
+            os.remove(f)
     rpc("tools/call", {"name": "xpspeak_close", "arguments": {}})
     pr.stdin.close()
     pr.wait(timeout=10)
     assert size > 1000, "导出不到 1KB: %d" % size
     assert saved > 1000 and head.startswith(b"XPSPEAK"), "存 .xps 异常: %d %r" % (saved, head)
-    print("selftest OK: %d 个工具，initialize/tools-list/fit/status/open/save/export/close 全通，导出 %d 字节、存 .xps %d 字节"
-          % (len(names), size, saved))
+    assert built > 1000, "xpspeak_build 产物异常: %d" % built
+    print("selftest OK: %d 个工具，initialize/tools-list/fit/status/open/save/export/build/close 全通，"
+          "导出 %d 字节、存 .xps %d 字节、生成 .xps %d 字节" % (len(names), size, saved, built))
 
 
 if __name__ == "__main__":

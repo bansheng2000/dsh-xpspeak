@@ -147,13 +147,45 @@ def ascii_crlf(path):
     实测 181 点的谱读成 91 点且 B.E. 列变成强度值。原文件不动，需要时返回一份 CRLF 副本路径。"""
     with open(path, "rb") as f:
         b = f.read()
-    if b"\r\n" in b:
+    crlf = b.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+    if crlf == b:
         return path
     os.makedirs(WORKDIR, exist_ok=True)
     out = os.path.join(WORKDIR, "crlf_" + os.path.basename(path))
     with open(out, "wb") as f:
-        f.write(b.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+        f.write(crlf)
     return out
+
+
+def _vis(pid):
+    return set(h for h in tops(pid) if u.IsWindowVisible(h))
+
+
+def wait_new(pid, before, timeout=10.0):
+    """等一个「之前不可见、现在可见」的窗体 —— XPSPeak 的对话框都是预先建好再 Show 的，
+    所以不能按句柄是否存在判断，只能比可见性。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        for h in tops(pid):
+            if u.IsWindowVisible(h) and h not in before:
+                return h
+        time.sleep(0.2)
+    return None
+
+
+def _btn(hwnd, caption):
+    for c in kids(hwnd):
+        if cls(c).startswith("ThunderRT6CommandButton") and text(c) == caption:
+            return c
+
+
+def _fill(hwnd, pairs):
+    for cid, val in pairs:
+        c = next((c for c in kids(hwnd) if u.GetDlgCtrlID(c) == cid), None)
+        if c is None:
+            raise KeyError("对话框 %r 没有控件 id=%s" % (text(hwnd), cid))
+        _set_window_text(c, val)
+        time.sleep(0.15)
 
 
 def launch(exe=EXE_DEFAULT):
@@ -227,3 +259,77 @@ if __name__ == "__main__":
         if n: print(open(sys.argv[3], encoding="utf-8", errors="replace").read()[:300])
     else:
         raise SystemExit(__doc__)
+
+
+def build(exe, src, peaks, out_xps, out_spec=None, out_par=None, background=None):
+    """一次调用：载谱 -> (扣背景) -> 逐个 Add Peak -> 导出谱图/参数 -> 存 .xps。
+
+    peaks: [{"pos": 162.059, "fwhm": 0.952, "area": 53963.0, "gl": 30}, ...]
+    关键实测：Add Peak 对话框里的 Area 会被真正采用（存出来的曲线面积与之一致）；
+    而用 .rpa 载入参数时首峰 Area 被软件按 height 反算忽略 —— 所以生成 .xps 必须走这条路。
+    background=None 时：ASCII 谱自动扣背景（需要它来建 Region），.xps 谱默认不动。
+    """
+    src, out_xps = os.path.normpath(src), os.path.normpath(out_xps)
+    if not os.path.exists(src):
+        raise FileNotFoundError(src)
+    ascii_src = not src.lower().endswith((".xps", ".rpa"))
+    if background is None:
+        background = ascii_src
+    os.makedirs(WORKDIR, exist_ok=True)
+    for f in (out_xps, out_spec, out_par):
+        if f and os.path.exists(f):
+            os.remove(f)
+    p = launch(exe)
+    try:
+        pid = p.pid
+        proc = form(pid, FORM_PROC)
+        fit = next(h for h in tops(pid) if cls(h) == "ThunderRT6FormDC" and u.GetMenu(h))
+        if ascii_src:
+            menu_click(fit, "Data", "Import (ASCII)", settle=1.0)
+            file_dialog(pid, None, ascii_crlf(src))
+        else:
+            click(button(proc, "Open XPS"))
+            file_dialog(pid, DLG_OPEN, src)
+        time.sleep(1.5)
+        _kill_strays(pid)
+        fit = next(h for h in tops(pid) if cls(h) == "ThunderRT6FormDC" and u.GetMenu(h))
+        if background:
+            before = _vis(pid)
+            menu_click(fit, "Background", None, settle=1.5)
+            dlg = wait_new(pid, before)
+            if dlg is None:
+                raise TimeoutError("Background 对话框没出现")
+            click(_btn(dlg, "Accept"), settle=2.5)
+        for pk in peaks:
+            before = _vis(pid)
+            menu_click(fit, "Add Peak", None, settle=1.5)
+            dlg = wait_new(pid, before)
+            if dlg is None:
+                raise TimeoutError("Add Peak 对话框没出现（%s）" % text(fit))
+            _fill(dlg, [(32, "%.4f" % float(pk["pos"])),
+                        (25, "%.4f" % float(pk["fwhm"])),
+                        (20, "%.2f" % float(pk["area"])),
+                        (13, "%d" % int(pk.get("gl", 30)))])
+            click(_btn(dlg, "Accept"), settle=2.0)
+        for path, kind in ((out_par, "Export (Peak Parameters)"), (out_spec, "Export (Spectrum)")):
+            if not path:
+                continue
+            menu_click(fit, "Data", kind, settle=1.0)
+            file_dialog(pid, None, path)
+            time.sleep(0.8)
+            _kill_strays(pid)
+        u.SetForegroundWindow(int(proc))
+        time.sleep(0.4)
+        click(button(proc, "Save XPS"), settle=1.2)
+        file_dialog(pid, DLG_OPEN, out_xps)
+        time.sleep(1.0)
+        _kill_strays(pid)
+    finally:
+        p.terminate()
+    for f, name in ((out_xps, "xps"), (out_spec, "spectrum"), (out_par, "params")):
+        if f and not os.path.exists(f):
+            raise RuntimeError("%s 没写出: %s" % (name, f))
+    return {"xps": out_xps, "xps_bytes": os.path.getsize(out_xps),
+            "spectrum": out_spec, "params": out_par,
+            "peaks": [{"pos": float(k["pos"]), "fwhm": float(k["fwhm"]),
+                       "area": float(k["area"]), "gl": int(k.get("gl", 30))} for k in peaks]}
