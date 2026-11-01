@@ -16,12 +16,14 @@
   * Import (ASCII) 只认 CRLF 行尾，LF-only 文件会被静默读错（点数减半、B.E. 列变成强度值）-> ascii_crlf()
   * 传给对话框的路径必须是反斜杠形式（"C:\a\b.dat"）：正斜杠会被 Save 对话框拒绝 -> 对话框不关、文件写不出
 """
-import ctypes, os, subprocess, sys, time, shutil
+import ctypes, itertools, os, re, subprocess, sys, time, shutil
 from ctypes import wintypes as w
 
 u = ctypes.windll.user32
+__version__ = "1.2.1"        # 与仓库 tag 同步；MCP 的 serverInfo.version 读这里，别再各写一个
 EXE_DEFAULT = r"E:\下载\XPS分峰软件XPSpeak41\XPS分峰软件XPSpeak41\XPSPEAK41.exe"
 WORKDIR = os.path.join(os.path.expanduser("~"), "xpspeak_auto")
+_SEQ = itertools.count(1)    # work_path 的唯一后缀
 FORM_PROC, FORM_FIT = "XPS Peak Processing", "XPS Peak Fit"
 DLG_OPEN, DLG_SAVE, DLG_IMPORT = "Open file", "Export Spectral", "Import Ascii format"   # 对话框标题按子串匹配
 DLG_SAVE_RPA = "Save region parameters"
@@ -65,7 +67,15 @@ def form(pid, title):
         if cls(h) == "ThunderRT6FormDC" and text(h) == title: return h
 
 
+def menu_form(pid):
+    """带菜单的那个窗体 = 分峰窗。标题会随区域改名（"XPS Peak Fit" → "Region 4"），只能靠「有菜单」认。"""
+    for h in tops(pid):
+        if cls(h) == "ThunderRT6FormDC" and u.GetMenu(h):
+            return h
+
+
 def button(hwnd, caption):
+    """按标题找按钮（唯一实现；原来的 _btn 是同一份代码，已合并过来）"""
     for c in kids(hwnd):
         if cls(c).startswith("ThunderRT6CommandButton") and text(c) == caption: return c
 
@@ -74,20 +84,41 @@ def dialogs(pid):
     return [h for h in tops(pid) if cls(h) == "#32770"]
 
 
-def menu_id(f, top, sub):
-    """按菜单文字取命令 id（比下标稳）"""
-    m = u.GetMenu(f)
-    for i in range(u.GetMenuItemCount(m)):
-        b = ctypes.create_unicode_buffer(128); u.GetMenuStringW(m, i, b, 128, MF_BYPOSITION)
-        if b.value.replace("&", "") != top: continue
+def menu_label(m, i):
+    b = ctypes.create_unicode_buffer(128); u.GetMenuStringW(m, i, b, 128, MF_BYPOSITION)
+    return b.value.replace("&", "")
+
+
+def menu_tree(hwnd):
+    """[(顶层项文字, [子项文字...]), ...] —— inventory 与 MCP 的 status 共用这一份，不再各写一遍。"""
+    m = u.GetMenu(hwnd)
+    out = []
+    for i in range(u.GetMenuItemCount(m) if m else 0):
         sm = u.GetSubMenu(m, i)
-        if not sm:                      # 顶层项本身就是命令（Background / Add Peak / Optimise Region / ReDisplay）
-            return u.GetMenuItemID(m, i)
-        for j in range(u.GetMenuItemCount(sm)):
-            b2 = ctypes.create_unicode_buffer(128); u.GetMenuStringW(sm, j, b2, 128, MF_BYPOSITION)
-            if sub is None or b2.value.replace("&", "") == sub:
-                return u.GetMenuItemID(sm, j)
-    raise KeyError("%s > %s" % (top, sub))
+        out.append((menu_label(m, i),
+                    [menu_label(sm, j) for j in range(u.GetMenuItemCount(sm) if sm else 0)]))
+    return out
+
+
+def menu_id(f, top, sub):
+    """按菜单文字取命令 id（比下标稳）。
+
+    顶层项带子菜单时**必须**显式给 sub：省略 sub 不能猜成「第一项」——
+    那会把 xpspeak_menu(top="Data") 变成真的去执行 Export (Spectrum) 并弹保存框。
+    """
+    items = dict(menu_tree(f))
+    if top not in items:
+        raise KeyError("没有顶层菜单 %r（有：%s）" % (top, " / ".join(items)))
+    children = items[top]
+    m = u.GetMenu(f)
+    idx = [n for n, _ in menu_tree(f)].index(top)
+    if not children:                     # 顶层项本身就是命令（Background / Add Peak / Optimise Region / ReDisplay）
+        return u.GetMenuItemID(m, idx)
+    if sub is None:
+        raise KeyError("%r 有子项，必须显式给 sub（可选：%s）" % (top, " / ".join(children)))
+    if sub not in children:
+        raise KeyError("%r 下没有子项 %r（可选：%s）" % (top, sub, " / ".join(children)))
+    return u.GetMenuItemID(u.GetSubMenu(m, idx), children.index(sub))
 
 
 def click(hwnd, settle=1.5):
@@ -98,17 +129,56 @@ def menu_click(f, top, sub, settle=2.0):
     u.PostMessageW(f, WM_COMMAND, menu_id(f, top, sub), 0); time.sleep(settle)
 
 
+OK_CAPTIONS = ("ok", "确定", "yes", "是", "&ok", "&yes")
+
+
+def ok_button(cands):
+    """从 [(caption, hwnd)] 里挑「确认」键：白名单优先，命中不到退回第一个（= 原来的行为）。
+    纯函数、不碰窗口，便于自检；覆盖确认类对话框的默认键未必是「是」，盲点第一个有风险。"""
+    for want in OK_CAPTIONS:
+        for cap, h in cands:
+            if (cap or "").strip().lower() == want:
+                return h
+    return cands[0][1] if cands else None
+
+
 def _kill_strays(pid, keep=()):
-    """关掉模态消息框（"Data file exported" 等）。
+    """关掉模态消息框（"Data file exported" / "Error Reading File" 等），返回被关掉的标题列表。
     实测坑：这类框的确定按钮 CtrlID=2、WM_COMMAND IDOK(1) 打不掉，必须直接 BM_CLICK 真按钮。"""
+    killed = []
     for h in dialogs(pid):
         if h in keep:
             continue
-        btn = next((c for c in kids(h) if cls(c) == "Button"), None)
+        btn = ok_button([(text(c), c) for c in kids(h) if cls(c) == "Button"])
         if btn:
             u.PostMessageW(btn, BM_CLICK, 0, 0)
         else:
             u.PostMessageW(h, WM_COMMAND, IDOK, 0)
+        killed.append(text(h) or cls(h))
+    return killed
+
+
+def has_text(hwnd, needle):
+    """窗口（含子控件）里有没有这段文字 —— 用来认 XPSPeak 的 "Error Reading File"。"""
+    if needle.lower() in (text(hwnd) or "").lower():
+        return True
+    return any(needle.lower() in (text(c) or "").lower() for c in kids(hwnd))
+
+
+def work_path(name):
+    """每次调用给一个唯一文件名（pid + 递增序号），并顺手清掉 30 分钟前的旧产物。
+    固定文件名（in.xps / crlf_xxx.dat）会让两次重跑互相覆盖，CRLF 副本还可能被当成这次的输入。"""
+    os.makedirs(WORKDIR, exist_ok=True)
+    now = time.time()
+    try:
+        for f in os.listdir(WORKDIR):
+            p = os.path.join(WORKDIR, f)
+            if os.path.isfile(p) and now - os.path.getmtime(p) > 30 * 60:
+                os.remove(p)
+    except OSError:
+        pass
+    stem, ext = os.path.splitext(name)
+    return os.path.join(WORKDIR, "%s_%d_%d%s" % (stem, os.getpid(), next(_SEQ), ext))
 
 
 def _set_window_text(h, s):
@@ -147,11 +217,13 @@ def ascii_crlf(path):
     实测 181 点的谱读成 91 点且 B.E. 列变成强度值。原文件不动，需要时返回一份 CRLF 副本路径。"""
     with open(path, "rb") as f:
         b = f.read()
-    crlf = b.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+    # 本轮补的坑：按「\r\n→\n、\r→\n、\n→\r\n」顺序替换会把 '\r\r\n' 变成「一行数据+一个空行」
+    # （实测 20 行变 40 行），XPSPeak 直接弹 Error Reading File。改成「按任意换行切分、丢空行、统一重连」。
+    lines = [ln for ln in re.split(rb"\r\n|\r|\n", b) if ln.strip()]
+    crlf = b"\r\n".join(lines) + (b"\r\n" if lines else b"")
     if crlf == b:
         return path
-    os.makedirs(WORKDIR, exist_ok=True)
-    out = os.path.join(WORKDIR, "crlf_" + os.path.basename(path))
+    out = work_path("crlf_" + os.path.basename(path))
     with open(out, "wb") as f:
         f.write(crlf)
     return out
@@ -173,12 +245,6 @@ def wait_new(pid, before, timeout=10.0):
     return None
 
 
-def _btn(hwnd, caption):
-    for c in kids(hwnd):
-        if cls(c).startswith("ThunderRT6CommandButton") and text(c) == caption:
-            return c
-
-
 def _fill(hwnd, pairs):
     for cid, val in pairs:
         c = next((c for c in kids(hwnd) if u.GetDlgCtrlID(c) == cid), None)
@@ -197,19 +263,29 @@ def launch(exe=EXE_DEFAULT):
     return p
 
 
+def proc_name(pid):
+    """进程可执行文件名（QueryFullProcessImageNameW，纯 ctypes，不装 psutil）。
+    用途：关进程前确认真的是 XPSPEAK41.exe，别把别的 VB6 程序 / 用户别的实例杀掉。"""
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.c_ulong(1024)
+        if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return None
+        return os.path.basename(buf.value)
+    finally:
+        k32.CloseHandle(h)
+
+
 def inventory(pid):
     for h in tops(pid):
         if not u.IsWindowVisible(h): continue
         print("TOP", hex(h), cls(h), repr(text(h)))
-        m = u.GetMenu(h)
-        for i in range(u.GetMenuItemCount(m) if m else 0):
-            b = ctypes.create_unicode_buffer(128); u.GetMenuStringW(m, i, b, 128, MF_BYPOSITION)
-            sm = u.GetSubMenu(m, i); items = []
-            if sm:
-                for j in range(u.GetMenuItemCount(sm)):
-                    b2 = ctypes.create_unicode_buffer(128); u.GetMenuStringW(sm, j, b2, 128, MF_BYPOSITION)
-                    items.append(b2.value.replace("&", ""))
-            print("   MENU", i, b.value.replace("&", ""), items)
+        for i, (name, items) in enumerate(menu_tree(h)):
+            print("   MENU", i, name, items)
         seen = {}
         for c in kids(h):
             k = (cls(c), text(c)); seen[k] = seen.get(k, 0) + 1
@@ -223,8 +299,7 @@ def export(exe, src, out, import_ascii=False):
     注意：传给文件对话框的路径必须是反斜杠形式，正斜杠会被 Save 对话框拒绝（对话框不关、也写不出文件）。
     """
     src, out = os.path.normpath(src), os.path.normpath(out)
-    os.makedirs(WORKDIR, exist_ok=True)
-    inp = os.path.join(WORKDIR, "in" + os.path.splitext(src)[1])
+    inp = work_path("in" + os.path.splitext(src)[1])
     shutil.copy(src, inp)
     if os.path.exists(out): os.remove(out)
     p = launch(exe)
@@ -283,7 +358,7 @@ def build(exe, src, peaks, out_xps, out_spec=None, out_par=None, background=None
     try:
         pid = p.pid
         proc = form(pid, FORM_PROC)
-        fit = next(h for h in tops(pid) if cls(h) == "ThunderRT6FormDC" and u.GetMenu(h))
+        fit = menu_form(pid)
         if ascii_src:
             menu_click(fit, "Data", "Import (ASCII)", settle=1.0)
             file_dialog(pid, None, ascii_crlf(src))
@@ -292,14 +367,14 @@ def build(exe, src, peaks, out_xps, out_spec=None, out_par=None, background=None
             file_dialog(pid, DLG_OPEN, src)
         time.sleep(1.5)
         _kill_strays(pid)
-        fit = next(h for h in tops(pid) if cls(h) == "ThunderRT6FormDC" and u.GetMenu(h))
+        fit = menu_form(pid)
         if background:
             before = _vis(pid)
             menu_click(fit, "Background", None, settle=1.5)
             dlg = wait_new(pid, before)
             if dlg is None:
                 raise TimeoutError("Background 对话框没出现")
-            click(_btn(dlg, "Accept"), settle=2.5)
+            click(button(dlg, "Accept"), settle=2.5)
         for pk in peaks:
             before = _vis(pid)
             menu_click(fit, "Add Peak", None, settle=1.5)
@@ -310,7 +385,7 @@ def build(exe, src, peaks, out_xps, out_spec=None, out_par=None, background=None
                         (25, "%.4f" % float(pk["fwhm"])),
                         (20, "%.2f" % float(pk["area"])),
                         (13, "%d" % int(pk.get("gl", 30)))])
-            click(_btn(dlg, "Accept"), settle=2.0)
+            click(button(dlg, "Accept"), settle=2.0)
         for path, kind in ((out_par, "Export (Peak Parameters)"), (out_spec, "Export (Spectrum)")):
             if not path:
                 continue

@@ -20,13 +20,17 @@ SKIP_DIRS = {"windows", "$recycle.bin", "system volume information", "node_modul
 
 
 def find_exe(hint=None):
-    """在常见位置按深度<=3 找 XPSPEAK41.exe；找不到返回 ''。"""
+    """按「下载/桌面/文档优先，再各盘根」的顺序找 XPSPEAK41.exe；找不到返回 ''。
+
+    顺序有讲究：整盘 os.walk 在 C: 上可能要跑很久，先把用户最可能放安装包的地方过一遍。
+    """
     if hint:
         return hint
     env = os.environ.get("XPSPEAK_EXE")
     if env and os.path.exists(env):
         return env
-    roots = [os.path.expanduser(r"~\Downloads"), os.path.expanduser(r"~\Desktop"), os.path.expanduser("~")]
+    roots = [os.path.expanduser(r"~\Downloads"), os.path.expanduser(r"~\Desktop"),
+             os.path.expanduser(r"~\Documents"), os.path.expanduser("~")]
     for d in "CDEFGH":
         p = d + ":\\"
         if os.path.isdir(p):
@@ -55,6 +59,8 @@ def main():
 
     if not os.path.isdir(SRC):
         sys.exit("找不到源目录：%s（请在仓库根目录运行本脚本）" % SRC)
+    if a.exe and not os.path.exists(a.exe):
+        sys.exit("--exe 指向的文件不存在：%s（写错路径等于装了个坏配置，直接停）" % a.exe)
     os.makedirs(a.dest, exist_ok=True)
     for f in FILES:
         shutil.copy2(os.path.join(SRC, f), os.path.join(a.dest, f))
@@ -72,6 +78,9 @@ def main():
 
     if a.json_only:
         print(text)
+        if not exe:
+            sys.stderr.write("没找到 XPSPEAK41.exe：请用 --exe 指定，或装好后手工填 XPSPEAK_EXE\n")
+            sys.exit(2)
         return
     print("已装到: %s" % a.dest)
     print("python: %s" % py)
@@ -79,6 +88,10 @@ def main():
     print("\n把它交给 DSH 的 mcp_connector_import_json（或写进别的客户端的 mcpServers）：\n")
     print(text)
     print("\n自检（会真开一次 XPSPeak，约 12 秒）: \"%s\" \"%s\" --selftest" % (py, os.path.join(a.dest, "xpspeak_mcp.py")))
+    if not exe:
+        # 文件已拷好、JSON 也写了，但这个配置是坏的（EXE 路径是占位符）—— 用非零码让调用方看见
+        sys.stderr.write("安装未完成：没找到 XPSPEAK41.exe（退出码 2）。用 --exe 指定，或改 mcpServers.json 里的 XPSPEAK_EXE\n")
+        sys.exit(2)
 
 
 if __name__ == "__main__":

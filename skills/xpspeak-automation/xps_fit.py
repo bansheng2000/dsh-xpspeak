@@ -16,12 +16,22 @@
   python xps_fit.py spec.dat --centers 162.09 --bg file
   python xps_fit.py spec.dat --centers 162.09,167.6 --scan 2 --csv curves.csv
   python xps_fit.py spec.dat --centers 162.09 --bg linear --csv out/curves.csv
-自检（不需要谱图文件，合成数据回归）：
+自检（不需要谱图文件，合成数据回归；含「撞界」与「简并初值」两条回归）：
   python xps_fit.py --selftest
+
+撞界：clamp 把参数夹到 ctol/wlo/whi/hmax 时，这些值就不再是「数据拟合出来的」。
+发生时会进 res["bound"] 与每个组分的 res["comps"][i]["bounds"]，report() 打 * 并给汇总行 ——
+出结论前必须先看这一行，否则会把边界值当成测量结果。
 """
-import json, math, sys
+import math, sys
 
 LOG2 = math.log(2.0)
+# 撞界判据：clamp 夹到边界时 |p-界| 精确为 0；没被夹住但落进 1e-6 相对容差的也算贴着边界。
+# 1e-6*max(1,|界|) → whi=4 给 4e-6、hmax=120000 给 0.12，都远小于参数自身的打印精度，
+# 所以正常收敛的参数不会被误判，而被夹住的参数一定命中。
+BOUND_REL = 1e-6
+BOUND_NAMES = ("center", "fwhm", "height")
+BOUND_LABELS = ("峰位", "FWHM", "峰高")
 
 
 def load(path, bg_col=4):
@@ -133,10 +143,64 @@ def _inv(A):
     return [row[n:] for row in M]
 
 
+def _widx(E, lo, hi):
+    """拟合窗口的索引（按**结合能值**取，lo/hi 单位 eV，与 E 的升/降序无关）。
+
+    lo=None 且 hi=None → 全谱（返回 None，向后兼容）。
+    窗口必须两端都给：只给一端无法确定区间；lo>=hi 视为写反/写错，直接报错而不是猜一个方向。
+    """
+    if lo is None and hi is None:
+        return None
+    if lo is None or hi is None:
+        raise ValueError("窗口必须同时给 lo 和 hi（eV）；只给一端无法确定区间")
+    if lo >= hi:
+        raise ValueError("窗口下界 lo=%.4f 必须小于上界 hi=%.4f（单位 eV）" % (lo, hi))
+    idx = [i for i, e in enumerate(E) if lo <= e <= hi]
+    if len(idx) < 10:
+        raise ValueError("窗口 [%.4f, %.4f] eV 内只有 %d 个点，至少要 10 个；"
+                         "检查 lo/hi 是否写反、或超出扫描范围 [%.3f, %.3f]"
+                         % (lo, hi, len(idx), min(E), max(E)))
+    return idx
+
+
+def _constraint_warnings(centers, ds, ratio):
+    """ds/ratio 与初值明显不匹配时的提示（只提示，不改默认值，也不改拟合结果）。"""
+    L = []
+    cs = sorted(centers)
+    gaps = [b - a for a, b in zip(cs, cs[1:])]
+    gap = min(gaps) if gaps else None
+    if ds < 2.0 and gap is not None and gap >= 2.0:
+        L.append("⚠ 初值最小间距 %.2f eV，但 ds=%.2f 是 2p 口径（1.16-1.20）：若这是 3d 双线（3.1-3.2）"
+                 "或 4f（~5.2），请改 ds —— 否则伴线位置本身就放错了" % (gap, ds))
+    if ds >= 2.5 and abs(ratio - 0.5) < 1e-9:
+        L.append("⚠ ds=%.2f 像 d 轨道（3d 劈裂 3.1-3.2），但 ratio=0.50 是 p 轨道的 1:2 口径；"
+                 "d 轨道分支比通常 2:3（0.667），请确认 ratio" % ds)
+    return L
+
+
 def fit(E, raw, bg, centers, ds=1.18, ratio=0.5, eta=0.3,
-        ctol=1.0, wlo=0.6, whi=4.0, hmax=120000.0, iters=400):
-    """带约束的 LM 拟合。返回 dict（含每组分参数±σ、rms、R²、AIC、残差）。"""
+        ctol=1.0, wlo=0.6, whi=4.0, hmax=120000.0, iters=400, lo=None, hi=None):
+    """带约束的 LM 拟合。返回 dict（含每组分参数±σ、rms、R²、AIC、残差、撞界清单）。
+
+    撞界见模块顶部说明：res["bound"] 列出顶到边界的参数，report()/MCP 文本都会显式写出。
+    lo/hi（eV）限定拟合窗口；窗口内重取两端作为基线端点，窗口外完全不参与。
+    """
+    win = (lo, hi)          # lo/hi 下面会被参数上下界复用，先把窗口参数存下来
+    idx = _widx(E, lo, hi)
+    if idx is not None:
+        E = [E[i] for i in idx]; raw = [raw[i] for i in idx]; bg = [bg[i] for i in idx]
     nc = len(centers)
+    # 初值间距 < 0.5×ctol（= 峰位自由区的半宽）时两个组分不可分辨：LM 会把同一个峰劈成两半、
+    # 各报 50%，而 50/50 是初值造成的、不是数据支撑的。0.5 eV 也远小于任何有物理意义的化学态
+    # 位移（2p 双线 1.18 eV、3d 3.2 eV），所以真双峰不会被误拒。直接报错，不给一个看着正常的假结果。
+    min_sep = 0.5 * ctol
+    cs = sorted(centers)
+    for c1, c2 in zip(cs, cs[1:]):
+        if c2 - c1 < min_sep:
+            raise ValueError(
+                "初值峰位 %.4f 与 %.4f 相距 %.4f eV < %.4f eV（= 0.5×ctol）：两个组分不可分离 —— "
+                "拟合会把同一个峰劈成两半、各报 50%%，占比不能作化学态依据。"
+                "请合并成一个 center，或显式放大 ctol 后再试。" % (c1, c2, c2 - c1, min_sep))
     target = [raw[i] - bg[i] for i in range(len(raw))]
     p = []
     for c in centers:
@@ -198,6 +262,16 @@ def fit(E, raw, bg, centers, ds=1.18, ratio=0.5, eta=0.3,
     inv = _inv(JtJ)
     s2 = sse / max(1, n - k)
     sig = [math.sqrt(abs(inv[j][j] * s2)) if inv else float("nan") for j in range(k)]
+    # 撞界：p 与 lo/hi 比对（判据见模块顶部 BOUND_REL）。
+    bound, atb = [], {}
+    for j, v in enumerate(p):
+        for side, lim in (("lo", lo[j]), ("hi", hi[j])):
+            if abs(v - lim) <= BOUND_REL * max(1.0, abs(lim)):
+                i, f = divmod(j, 3)
+                bound.append(dict(comp=i + 1, param=BOUND_NAMES[f], label=BOUND_LABELS[f],
+                                  side=side, value=float(v), limit=float(lim)))
+                atb.setdefault(i, []).append(BOUND_NAMES[f])
+                break
     mean_t = sum(target) / n
     sst = sum((t - mean_t) ** 2 for t in target)
     af = area_factor(eta) * (1.0 + ratio)
@@ -205,10 +279,17 @@ def fit(E, raw, bg, centers, ds=1.18, ratio=0.5, eta=0.3,
     for i in range(nc):
         c, w, h = p[3 * i], p[3 * i + 1], p[3 * i + 2]
         area = h * w * af
-        s_area = area * math.hypot(sig[3 * i] / abs(c) if c else 0.0, sig[3 * i + 1] / w if w else 0.0)
+        # σ_area 传播：area = h·w·af（af 只依赖 eta，与峰位无关）。只保留真正进公式的两项：
+        #   · 补上 height 项 —— 原来漏了，σ 系统性偏小（本次修正的主项）；
+        #   · 去掉 center 项 —— 峰位不参与面积公式，原来那一项是错项。
+        # 两项按独立处理（不做协方差修正）：h 与 w 在 LM 里通常正相关，忽略协方差项得到的是
+        # 偏大的保守上界；宁可报大一点，也不要报一个看起来更精的偏小 σ。
+        s_area = area * math.sqrt((sig[3 * i + 1] / w if w else 0.0) ** 2
+                                  + (sig[3 * i + 2] / h if h else 0.0) ** 2)
         comps.append(dict(center=round(c, 4), center_err=round(sig[3 * i], 4),
                           partner=round(c + ds, 4), fwhm=round(w, 4), fwhm_err=round(sig[3 * i + 1], 4),
-                          height=round(h, 1), area=round(area, 1), area_err=round(s_area, 1)))
+                          height=round(h, 1), area=round(area, 1), area_err=round(s_area, 1),
+                          bounds=atb.get(i, [])))
     tot = sum(c["area"] for c in comps) or 1.0
     for c in comps:
         c["pct"] = round(100.0 * c["area"] / tot, 2)
@@ -219,22 +300,63 @@ def fit(E, raw, bg, centers, ds=1.18, ratio=0.5, eta=0.3,
     return dict(nc=nc, n=n, k=k, ds=ds, ratio=ratio, eta=eta,
                 rms=round(math.sqrt(sse / n), 2), r2=round(1.0 - sse / sst, 6) if sst else None,
                 aic=round(n * math.log(sse / n) + 2 * k, 2), sse=round(sse, 2),
-                comps=comps, params=[float(v) for v in p],
+                comps=comps, params=[float(v) for v in p], params_err=[round(v, 6) for v in sig], bound=bound,
+                warnings=_constraint_warnings(centers, ds, ratio),
+                window=dict(lo=win[0], hi=win[1]), n_points=len(E),
+                limits=dict(ctol=ctol, wlo=wlo, whi=whi, hmax=hmax), peak_max=round(max(target), 1),
                 curves=dict(E=E, target=target, fit=[target[i] - r[i] for i in range(n)], resid=r))
 
 
-def report(res, head=""):
+def bound_text(res):
+    """撞界的汇总文本。report()（CLI）与 MCP 的 xpspeak_fit 都走它，保证两条路都会显式写出来。"""
+    b = res.get("bound") or []
+    if not b:
+        return ""
+    def _v(x):
+        return ("%.0f" % x) if abs(x) >= 1000 else ("%.4g" % x)
+    items = "、".join("组分%d %s=%s（%s %s）" % (x["comp"], x["label"], _v(x["value"]),
+                                              "下限" if x["side"] == "lo" else "上限", _v(x["limit"]))
+                     for x in b)
+    L = ["⚠ 撞界: %d 个参数顶到上下界 —— %s" % (len(b), items),
+         "⚠ 顶界的参数由约束决定、不是数据拟合出来的 —— 结论不可信（先改初值/放宽 ctol，或减少峰数）"]
+    lim, pm = res.get("limits") or {}, res.get("peak_max") or 0.0
+    if any(x["param"] == "height" and x["side"] == "hi" for x in b) and pm > (lim.get("hmax") or 0):
+        L.append("⚠ 输入峰值 %.0f 超过 hmax=%.0f（默认上限）：曲线被截断，R²/面积此刻不可用，"
+                 "请显式提高 hmax 再拟合" % (pm, lim["hmax"]))
+    if any(x["param"] == "fwhm" and x["side"] == "lo" for x in b):
+        L.append("⚠ FWHM 顶到 wlo=%.2f：谱里可能有更窄的峰，请降低 wlo（否则 FWHM 只是被压平的假值）"
+                 % (lim.get("wlo") or 0))
+    return "\n".join(L)
+
+
+def report(res, head="", include_bounds=True, include_warnings=True):
     L = [head] if head else []
     L.append("模型: %d 条双峰（Δ=%.3f eV, 面积比 1:%.2f, 等宽, eta=%.2f）  n=%d  k=%d"
              % (res["nc"], res["ds"], res["ratio"], res["eta"], res["n"], res["k"]))
     L.append("拟合优度: rms=%.2f cps   R²=%s   AIC=%.2f" % (res["rms"], res["r2"], res["aic"]))
+    w = res.get("window") or {}
+    if w.get("lo") is not None:
+        L.append("窗口: %.3f – %.3f eV（%d 点，基线的两个端点在窗口内重取）"
+                 % (w["lo"], w["hi"], res.get("n_points") or res["n"]))
+    if include_warnings:
+        for msg in (res.get("warnings") or []):
+            L.append(msg)
     for i, c in enumerate(res["comps"], 1):
-        L.append("  组分%d: %.3f±%.3f eV (伴线 %.3f)  FWHM %.3f±%.3f  area %.0f±%.0f (%.1f%%)  h=%.0f"
-                 % (i, c["center"], c["center_err"], c["partner"], c["fwhm"], c["fwhm_err"],
-                    c["area"], c["area_err"], c["pct"], c["height"]))
+        bd = set(c.get("bounds") or ())
+        st = lambda nm: "*" if nm in bd else ""
+        L.append("  组分%d: %.3f%s±%.3f eV (伴线 %.3f)  FWHM %.3f%s±%.3f  area %.0f±%.0f (%.1f%%)  h=%.0f%s"
+                 % (i, c["center"], st("center"), c["center_err"], c["partner"],
+                    c["fwhm"], st("fwhm"), c["fwhm_err"],
+                    c["area"], c["area_err"], c["pct"], c["height"], st("height")))
     rs = res["curves"]["resid"]
     L.append("残差: 均值 %.1f  sd %.1f  最大 |%.0f|" % (sum(rs) / len(rs), math.sqrt(sum(v * v for v in rs) / len(rs)),
                                                      max(abs(v) for v in rs)))
+    if res.get("bound"):
+        L.append("（* = 该参数顶到了上下界，不是数据拟合出来的值）")
+    if include_bounds:
+        bt = bound_text(res)
+        if bt:
+            L.append(bt)
     return "\n".join(L)
 
 
@@ -247,8 +369,14 @@ def write_csv(path, res):
     return path
 
 
-def run(path, centers, bg_kind="file", bg_col=4, ds=1.18, ratio=0.5, eta=0.3, csv=None, scan=0):
+def run(path, centers, bg_kind="file", bg_col=4, ds=1.18, ratio=0.5, eta=0.3, csv=None, scan=0,
+        ctol=1.0, wlo=0.6, whi=4.0, hmax=120000.0, lo=None, hi=None):
     E, raw, bgcol, ncol = load(path, bg_col)
+    # 窗口在算背景之前就切：linear/shirley 的端点必须取窗口两端，否则窗口外的峰肩会把基线带飞。
+    idx = _widx(E, lo, hi)
+    if idx is not None:
+        E = [E[i] for i in idx]; raw = [raw[i] for i in idx]
+        bgcol = [bgcol[i] for i in idx] if bgcol else None
     if bg_kind == "file":
         if bgcol is None:
             raise ValueError("文件只有 %d 列，没有背景列；请用 --bg linear|shirley|none" % ncol)
@@ -261,11 +389,13 @@ def run(path, centers, bg_kind="file", bg_col=4, ds=1.18, ratio=0.5, eta=0.3, cs
         bg = [0.0] * len(raw)
     else:
         raise ValueError("bg 只支持 file / linear / shirley / none")
-    res = fit(E, raw, bg, centers, ds, ratio, eta)
+    res = fit(E, raw, bg, centers, ds, ratio, eta, ctol, wlo, whi, hmax, lo=lo, hi=hi)
     if scan:
         for nc in range(1, min(scan, len(centers)) + 1):
-            res["scan%d" % nc] = {k: v for k, v in fit(E, raw, bg, centers[:nc], ds, ratio, eta).items()
-                                  if k in ("nc", "n", "k", "rms", "r2", "aic")}
+            res["scan%d" % nc] = {k: v for k, v in
+                                  fit(E, raw, bg, centers[:nc], ds, ratio, eta, ctol, wlo, whi, hmax,
+                                      lo=lo, hi=hi).items()
+                                  if k in ("nc", "n", "k", "rms", "r2", "aic", "bound")}
     if csv:
         write_csv(csv, res)
     return res      # 保留 curves（report/写图要用）；序列化前自行剔除
@@ -275,7 +405,7 @@ def selftest():
     """合成一条双峰谱（真值 162.00 / FWHM 0.95 / 面积 80000），验证能拟合回来。"""
     ds, ratio, eta = 1.18, 0.5, 0.3
     E = [175.9 - 0.1 * i for i in range(181)]
-    truth = [162.0, cz := 0.95, 54000.0]
+    truth = [162.0, 0.95, 54000.0]
     raw, bg = [], []
     for e in E:
         b = 5900.0 - 3.0 * (e - 158.0)
@@ -290,6 +420,72 @@ def selftest():
     assert res["r2"] > 0.9999, res["r2"]
     print("selftest OK: center %.3f (真值 162.000)  FWHM %.3f (0.950)  area %.0f (%.0f)  R² %.6f"
           % (c["center"], c["fwhm"], c["area"], area_truth, res["r2"]))
+
+    # --- P0-1/P0-3 回归：撞界必须显式标出（峰高超默认 hmax + FWHM 低于默认 wlo）---
+    E2 = [166.0 - 0.02 * i for i in range(301)]
+    raw2 = [model_at(e, [163.0, 0.35, 200000.0], 1, ds, ratio, eta) for e in E2]
+    r2 = fit(E2, raw2, [0.0] * len(E2), [163.05], ds, ratio, eta)
+    bt = bound_text(r2)
+    assert bt, "峰高 200000 / FWHM 0.35 明明顶到 hmax/wlo，却没有撞界标注"
+    assert "结论不可信" in bt and "hmax" in bt and "wlo" in bt, bt
+    assert r2["comps"][0]["bounds"], r2["comps"]
+    assert "*" in report(r2), report(r2)
+
+    # --- P0-1 反向：正常谱不许误报撞界 ---
+    E3 = [175.9 - 0.1 * i for i in range(181)]
+    bg3 = [5900.0 - 3.0 * (e - 158.0) for e in E3]
+    raw3 = [bg3[i] + model_at(E3[i], [162.0, 0.95, 54000.0], 1, ds, ratio, eta) for i in range(len(E3))]
+    r3 = fit(E3, raw3, bg3, [162.05], ds, ratio, eta)
+    assert not r3["bound"], r3["bound"]
+
+    # --- P0-2 回归：简并初值必须被拒绝 ---
+    try:
+        fit(E3, raw3, bg3, [162.0, 162.0], ds, ratio, eta)
+    except ValueError as e:
+        assert "不可分离" in str(e), e
+    else:
+        raise AssertionError("简并初值（162.0 / 162.0）没有被拒绝，会静默给出 50/50 的假组分")
+
+    # --- S3 回归：σ_area 必须含 height 项（原来漏掉 → σ 系统性偏小）---
+    # 无噪声谱的 σ 恒为 0，检验不出漏项；加一份确定性"噪声"让 σh 真的出现。
+    nz = [1200.0 * (((i * 7919) % 97) / 97.0 - 0.5) for i in range(len(E))]
+    rn = fit(E, [raw[i] + nz[i] for i in range(len(E))], bg, [162.05], ds, ratio, eta)
+    cn = rn["comps"][0]
+    se = cn["area_err"] / cn["area"]
+    need = math.hypot(rn["params_err"][2] / cn["height"], rn["params_err"][1] / cn["fwhm"])
+    assert rn["params_err"][2] > 0, "有噪声时 σh 应当 > 0"
+    assert abs(se - need) < 1e-4, ("σ_area 与 h·w 两项传播不符（height 项可能又漏了）", se, need)
+
+    # --- S2 回归：拟合窗口 lo/hi（窗口外的强峰不得参与；边界必须报错）---
+    E4 = [169.0 - 0.05 * i for i in range(121)]                    # 169 -> 163 eV
+    bg4 = [500.0 if e > 165.0 else 100.0 for e in E4]
+    raw4 = [bg4[i] + model_at(E4[i], [165.0, 1.0, 8000.0], 1, 0.0, 0.0, eta)
+            + model_at(E4[i], [168.2, 0.8, 6000.0], 1, 0.0, 0.0, eta) for i in range(len(E4))]
+    r_all = fit(E4, raw4, bg4, [165.05], ds=0.0, ratio=0.0, eta=eta)
+    r_win = fit(E4, raw4, bg4, [165.05], ds=0.0, ratio=0.0, eta=eta, lo=163.0, hi=166.2)
+    assert r_all["n"] == 121 and r_win["n"] == 65, (r_all["n"], r_win["n"])
+    assert r_all["r2"] < 0.90 and r_win["r2"] > 0.99, (r_all["r2"], r_win["r2"])
+    for bad_lo, bad_hi in ((166.2, 163.0), (165.0, 165.0)):
+        try:
+            fit(E4, raw4, bg4, [165.05], ds=0.0, ratio=0.0, eta=eta, lo=bad_lo, hi=bad_hi)
+        except ValueError as e:
+            assert "必须小于" in str(e), e
+        else:
+            raise AssertionError("lo>=hi 没有被拒绝: %r" % ((bad_lo, bad_hi),))
+    try:
+        fit(E4, raw4, bg4, [165.05], ds=0.0, ratio=0.0, eta=eta, lo=166.0, hi=166.1)
+    except ValueError as e:
+        assert "至少要 10" in str(e), e
+    else:
+        raise AssertionError("窗口内点太少没有被拒绝")
+
+    # --- S12 回归：ds/ratio 与初值明显不匹配必须提示出来 ---
+    r12 = fit(E3, raw3, bg3, [162.0, 165.2], ds, ratio, eta)      # 初值间距 3.2 但 ds=1.18
+    assert "2p 口径" in report(r12), report(r12)
+    assert any("2:3" in m for m in _constraint_warnings([233.05], 3.2, 0.5)), "d 轨道 ratio 不匹配没提示"
+    assert not _constraint_warnings([162.05], 1.18, 0.5), "2p 正常参数不该有提示"
+
+    print("selftest P0: 撞界标注 + 简并初值拒绝 OK")
 
 
 def main(argv):

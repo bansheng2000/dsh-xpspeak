@@ -18,7 +18,7 @@
 
 **0. 一条命令**（推荐；在仓库根目录，只要有 Python 就行）：
 
-    python install.py
+    "<PYTHON.exe>" install.py
 
 它会：把 `SKILL.md` + 三个 .py 拷到 `%USERPROFILE%\.agents\skills\xpspeak-automation\\`、在常见位置自动搜 `XPSPEAK41.exe`、打印一段**可直接导入的 mcpServers JSON**（同目录还会落一份 `mcpServers.json`）。
 参数：`--exe <路径>` 指定 XPSPEAK41.exe、`--dest <目录>` 换安装位置、`--json-only` 只打印 JSON。
@@ -43,14 +43,14 @@ DSH 用 `mcp_connector_import_json` 粘贴这段即可；其它客户端写进�
 
 不用 MCP 也能跑：
 
-    python xpspeak_drive.py inventory
-    python xpspeak_drive.py export <in.xps> <out.dat>
-    python xpspeak_drive.py importascii <in.txt> <out.dat>
+    "<PYTHON.exe>" xpspeak_drive.py inventory
+    "<PYTHON.exe>" xpspeak_drive.py export <in.xps> <out.dat>
+    "<PYTHON.exe>" xpspeak_drive.py importascii <in.txt> <out.dat>
 
 ## 要求
 
 - Windows + 已安装 XPSPeak 4.1（`XPSPEAK41.exe`）
-- Python 3.8+，标准库即可
+- Python 3.8+，标准库即可。**命令里的 `<PYTHON.exe>` 不是随便写的 `python`**：本机裸 `python` 可能是 WindowsApps 存根（退出码 49、零输出、什么都不做），一律写真实 `python.exe` 的绝对路径；DSH 自带的在 `C:\Users\12576\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
 - `XPSPEAK_EXE` 指向本机的 XPSPEAK41.exe（不同机器路径不同，这是唯一需要改的旋钮）
 
 ## 分峰：用 `xpspeak_fit`，别用 GUI 的 Optimise
@@ -59,10 +59,11 @@ XPSPeak 4.1 的 Optimise 是**无约束**优化：实测把 MoS₂/S 2p 跑成 2
 
 `xpspeak_fit` 用参数化内建约束（自旋轨道劈裂 Δ 固定、面积比固定、双峰等宽），毫秒级出 center/FWHM/面积±σ + rms/R²/AIC，还能一次扫 1..N 条模型做 AIC 对比：
 
-    python skills/xpspeak-automation/xps_fit.py out/mos_s2p_export.dat --centers 162.09 --bg file
-    python skills/xpspeak-automation/xps_fit.py out/mos_s2p_export.dat --centers 162.09,167.6,169.2 --bg file --scan 3
+    "<PYTHON.exe>" skills/xpspeak-automation/xps_fit.py out/mos_s2p_export.dat --centers 162.09 --bg file
+    "<PYTHON.exe>" skills/xpspeak-automation/xps_fit.py out/mos_s2p_export.dat --centers 162.09,167.6,169.2 --bg file --scan 3
 
-回归基准（MoS₂/S 2p，181 点）：162.059±0.003 eV、FWHM 0.952±0.006、area 80944±518、rms 577.4、R² 0.996822、AIC 2307.8。
+回归基准（MoS₂/S 2p，181 点）：162.059±0.003 eV、FWHM 0.952±0.006、area 80944±698、rms 577.4、R² 0.996822、AIC 2307.8。
+（area 的 σ 从旧记录的 ±518 变成 ±698：旧公式漏了 height 项、σ 系统性偏小，现已按 `area=h·w·af` 传播两项；中心值 80944 与其余指标一位没变。）
 
 
 ## 生成 .xps：用 `xpspeak_build`

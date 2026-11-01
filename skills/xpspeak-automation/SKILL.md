@@ -31,7 +31,7 @@ description: 用 AI/脚本控制 XPSPeak 4.1（XPSPEAK41.exe，XPS 分峰软件�
 ### 第 0 步（最快）：一条命令
 从 GitHub 拿到仓库后，在仓库根目录：
 
-    python install.py
+    "<PYTHON.exe>" install.py
 
 它自动做完「拷文件到技能库 → 找 XPSPEAK41.exe → 打印可直接导入的 mcpServers JSON」，下面第 1、2 步就不用手工了（`--exe/--dest/--json-only` 可覆盖；同目录会落一份 `mcpServers.json`）。
 
@@ -40,9 +40,10 @@ description: 用 AI/脚本控制 XPSPeak 4.1（XPSPEAK41.exe，XPS 分峰软件�
 ### 前提
 - Windows（必须；XPSPeak 只有 Windows 版），已装好 XPSPeak 4.1（`XPSPEAK41.exe`）
 - Python 3.8+（**标准库就够**，不需要 pip 装任何东西；DSH 自带 runtime 的 python.exe 也能用）
+  - **别直接敲 `python`**：本机裸 `python` 可能是 WindowsApps 存根（退出码 49、零输出，看着像命令没跑），一律用真实 `python.exe` 绝对路径，例如 DSH 自带的 `C:\Users\12576\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
 
 ### 第 1 步：放文件（整个目录一起拷）
-把 `xpspeak-automation/`（含 SKILL.md + 两个 .py）拷到一个**固定不变**的目录，推荐：
+把 `xpspeak-automation/`（含 SKILL.md + 三个 .py）拷到一个**固定不变**的目录，推荐：
 
     %USERPROFILE%\.agents\skills\xpspeak-automation\
 
@@ -75,9 +76,9 @@ MCP 配置**必须重启客户端才生效**。重启后先调 `xpspeak_status`�
 ### 磁盘/离线替代
 不想装 MCP 也能用，直接命令行：
 
-    python xpspeak_drive.py inventory                    # 打印窗口/菜单/控件清单（排查用）
-    python xpspeak_drive.py export <in.xps> <out.dat>    # 打开谱图 → 导出 ASCII
-    python xpspeak_drive.py importascii <in.txt> <out.dat>
+    "<PYTHON.exe>" xpspeak_drive.py inventory                    # 打印窗口/菜单/控件清单（排查用）
+    "<PYTHON.exe>" xpspeak_drive.py export <in.xps> <out.dat>    # 打开谱图 → 导出 ASCII
+    "<PYTHON.exe>" xpspeak_drive.py importascii <in.txt> <out.dat>
 
 ---
 
@@ -89,7 +90,7 @@ MCP 配置**必须重启客户端才生效**。重启后先调 `xpspeak_status`�
 
 | 工具 | 干什么 | 关键参数 |
 |---|---|---|
-| `xpspeak_fit` | 带约束双线拟合，不启动 GUI | `path`；`centers`（各组分主峰初值 eV）；`bg`=file/linear/shirley/none；`ds`（劈裂 ΔBE）；`ratio`（伴线面积比）；`eta`（%L）；`scan`（扫 1..N 条模型）；`csv` |
+| `xpspeak_fit` | 带约束双线拟合，不启动 GUI | `path`；`centers`（各组分主峰初值 eV）；`bg`=file/linear/shirley/none；`ds`（劈裂 ΔBE）；`ratio`（伴线面积比）；`eta`（%L）；`ctol`/`wlo`/`whi`/`hmax`（边界，默认 1.0/0.6/4.0/120000）；`window`（拟合窗口 [lo,hi] eV，Shirley 端点按窗口重取）；`scan`（扫 1..N 条模型）；`csv` |
 | `xpspeak_build` | 一次调用生成 .xps（载谱→扣背景→逐个 Add Peak→导出→Save XPS，并回读复核面积） | `path`；`peaks`=[{pos,fwhm,area,gl}]；`out`（.xps）；`spec`/`par`（可选导出）；`bg` |
 | `xpspeak_status` | 启动并返回 pid、窗体、按钮、全部菜单项。**任何操作前先调它** | — |
 | `xpspeak_open` | 载入谱图 | `path`；`source`=auto/xps/ascii（auto 按扩展名：.xps/.rpa 走 Open XPS，其余走 Import (ASCII)） |
@@ -97,7 +98,7 @@ MCP 配置**必须重启客户端才生效**。重启后先调 `xpspeak_status`�
 | `xpspeak_save` | 存原生文件 | `path`；`what`=xps（谱图+背景+已定峰，可被 open 原样载回）或 rpa（只存区域峰参数，可套到别的谱） |
 | `xpspeak_menu` | 执行任意菜单 | `top`（Data / Parameters / Add Peak / Background / Optimise Region / ReDisplay），`sub`，`settle`（等待秒数，默认 2） |
 | `xpspeak_click` | 按标题点按钮 | `caption`（Open XPS / Save XPS / Optimise All / Close / Options / 区域号 1..10），`form`=processing/fit |
-| `xpspeak_close` | 关进程 | — |
+| `xpspeak_close` | 关进程（**先校验进程名是 XPSPEAK41.EXE，不是就拒绝**，防止误杀别的 VB6 程序） | `pid`（可选） |
 
 菜单可用项：`Data > Export (Spectrum) / Export (Peak Parameters) / Import (ASCII) / Import (Kratos|Leybold|Phi|VAMAS)`；
 `Parameters > Load|Save Region Parameters / Clear Parameters / Delete Region / Region Shift`；
@@ -110,7 +111,8 @@ MCP 配置**必须重启客户端才生效**。重启后先调 `xpspeak_status`�
 - **别用「造 .rpa 再 Load Region Parameters」生成 .xps**：实测首峰 Area 被软件按 height 反算忽略（写 53963 读回 40401.88 = height×FWHM×FK），主峰曲线画小约 25%，文件与参数不自洽。
 - `xpspeak_fit` 把约束做进参数化（Δ 固定、面积比固定、双峰等宽），只放 center/FWHM/height —— 这就是可发表版本；放开约束的结果可作为系统误差上界。
 
-回归基准（MoS₂/S 2p，181 点，背景用文件自带 Shirley）：162.059±0.003 eV、FWHM 0.952±0.006、area 80944±518、rms 577.4、R² 0.996822、AIC 2307.8；2/3 条双线对照 543.5/2291.9、506.9/2272.7（追加组分 FWHM 撞上界 → 判为无新化学态）。
+回归基准（MoS₂/S 2p，181 点，背景用文件自带 Shirley）：162.059±0.003 eV、FWHM 0.952±0.006、area 80944±698、rms 577.4、R² 0.996822、AIC 2307.8；2/3 条双线对照 543.5/2291.9、506.9/2272.7（追加组分 FWHM 撞上界 → 判为无新化学态）。
+（area 的 σ 由旧的 ±518 更正为 ±698：旧公式只算 c/w 两项、漏了 height，σ 偏小；中心值未变。）
 
 ---
 
