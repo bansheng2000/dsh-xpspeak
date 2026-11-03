@@ -29,7 +29,50 @@ def _pid_of(h):
     return p.value
 
 
-STATE = {"owned": False}     # 本次进程是否自己启动了 XPSPeak（决定 selftest 能不能关它）
+class TeachingMode(Exception):
+    """教学模式：拒绝任何会改变界面的调用（见 SKILL.md「两档模式」）。
+
+    它继承 Exception 而不是返回普通文本，是为了让客户端看到 isError —— 拒绝不能被读成成功。
+    """
+
+
+# 会改变界面的工具（点按钮 / 发菜单 / 开存文件 / 关进程 / 跑整条流水线）。
+# xpspeak_status（读窗口与菜单）、xpspeak_fit（纯计算，不碰 GUI）不是写操作，教学模式照常可用。
+MUTATING = {"xpspeak_open", "xpspeak_export", "xpspeak_save", "xpspeak_menu",
+            "xpspeak_click", "xpspeak_close", "xpspeak_build"}
+# 默认代执行（沿用老行为）；XPSPEAK_MODE=teach 可以让整个 server 一上来就是只读教学模式
+STATE = {"owned": False,
+         "mode": "teach" if os.environ.get("XPSPEAK_MODE", "").strip().lower().startswith("teach") else "exec"}
+
+
+def _manual_hint(name, a):
+    """把被拒绝的那次调用翻成一句「你自己该怎么点」，拒绝才不是一句空话。"""
+    if name == "xpspeak_open":
+        return "请你自己在 XPS Peak Processing 窗口点「Open XPS」（或 Data > Import (ASCII)）打开 %s" % a.get("path")
+    if name == "xpspeak_click":
+        where = "XPS Peak Processing 窗口" if a.get("form", "processing") == "processing" else "分峰窗（标题会随区域改名，就是带菜单那个）"
+        return "请在 %s 里自己点「%s」按钮" % (where, a.get("caption"))
+    if name == "xpspeak_menu":
+        return "请你自己走菜单：%s%s" % (a.get("top"), (" > " + a["sub"]) if a.get("sub") else "")
+    if name == "xpspeak_export":
+        kind = "Export (Spectrum)" if a.get("what", "spectrum") == "spectrum" else "Export (Peak Parameters)"
+        return "请你自己走 Data > %s，存到 %s" % (kind, a.get("path"))
+    if name == "xpspeak_save":
+        return "请你自己点 %s" % ("Save XPS（Processing 窗口）" if a.get("what", "xps") == "xps"
+                                else "Parameters > Save Region Parameters")
+    if name == "xpspeak_close":
+        return "请你自己关掉 XPSPeak 窗口（我不替你关）"
+    if name == "xpspeak_build":
+        return ("这一步是整条流水线（载谱 → 扣背景 → 逐个 Add Peak → 导出 → Save XPS），"
+                "教学模式要一步一步自己来；想让我一次做完就说「你来吧」")
+    return ""
+
+
+def _refuse_in_teach(name, a):
+    raise TeachingMode(
+        "教学模式：不替你点按钮 —— 这一步请你操作。\n%s\n"
+        "（只读调用照常可用：xpspeak_status 看窗口/菜单/当前值，xpspeak_fit 做数值拟合。"
+        "要我代做就说「你来吧」，我会先复述授权范围再动手。）" % (_manual_hint(name, a) or "（未知调用）"))
 
 
 def find_pid():
@@ -86,11 +129,19 @@ def app(launch=True):
     return (pid,) + _require_forms(pid)
 
 
-def do_status():
+def do_status(mode=None):
+    if mode:
+        m = str(mode).strip().lower()
+        if m not in ("teach", "exec"):
+            raise ValueError("mode 只支持 teach（教学模式）/ exec（代执行），收到 %r" % (mode,))
+        STATE["mode"] = m
     pid, proc, fit = app()
     out = ["pid=%s" % pid,
            "XPS Peak Processing = %s" % (hex(proc) if proc else "无"),
            "XPS Peak Fit        = %s" % (hex(fit) if fit else "无")]
+    out.append("模式: %s" % ("教学模式（只读：会改界面的调用一律拒绝，由你自己点）"
+                            if STATE["mode"] == "teach"
+                            else "代执行（在授权范围内一次做完；扩大范围前先问）"))
     if proc:
         btns = [D.text(c) for c in D.kids(proc)
                 if D.cls(c).startswith("ThunderRT6CommandButton") and D.text(c)]
@@ -348,12 +399,15 @@ def do_close(pid=None):
 
 
 def do_call(name, a):
+    # 教学模式闸门：在读窗口/动任何东西**之前**就判，连 app() 都不会去启动或接管进程。
+    if STATE["mode"] == "teach" and name in MUTATING:
+        _refuse_in_teach(name, a)
     if name == "xpspeak_fit":
         return do_fit(a)
     if name == "xpspeak_build":
         return do_build(a)
     if name == "xpspeak_status":
-        return do_status()
+        return do_status(a.get("mode"))
     if name == "xpspeak_open":
         return do_open(a["path"], a.get("source", "auto"))
     if name == "xpspeak_export":
@@ -410,7 +464,12 @@ TOOLS = [
       "par": dict(S, description="可选：同时导出峰参数表到这个路径"),
       "bg": {"type": "boolean", "description": "是否先扣背景建区域；ASCII 源默认 true，.xps 源默认 false"}},
      ["path", "peaks"]),
-    ("xpspeak_status", "启动（若未运行）并返回 XPSPeak 进程号、窗体、按钮和全部菜单项。任何操作前先调它。", {}, []),
+    ("xpspeak_status",
+     "启动（若未运行）并返回进程号、窗体、按钮、全部菜单项和当前模式。任何操作前先调它。"
+     "mode=teach 切到教学模式：只读，open/export/save/menu/click/close/build 一律拒绝并回「这一步请你操作」"
+     "（用户想学软件时用这档）；mode=exec 切到代执行：在授权范围内一次做完（用户说「你来吧」才切）。",
+     {"mode": {"type": "string", "enum": ["teach", "exec"],
+               "description": "切模式：teach=教学模式（只读）/ exec=代执行；省略则只读当前模式"}}, []),
     ("xpspeak_open", "载入谱图。source=auto 按扩展名判断（.xps/.rpa 走 Open XPS，其余走 Data>Import (ASCII)，ASCII 若是 LF 换行会自动改用 CRLF 副本）。",
      {"path": dict(S, description="谱图文件绝对路径（.xps / .rpa / 两列 BE+Intensity 的 ASCII）"),
       "source": {"type": "string", "enum": ["auto", "xps", "ascii"], "description": "默认 auto"}}, ["path"]),
@@ -553,6 +612,19 @@ def selftest():
     for f in (bspec, bxps):
         if os.path.exists(f):
             os.remove(f)
+    # 教学模式闸门：写操作必须被拒绝，而且不能"看起来拒绝、其实点了"
+    rpc("tools/call", {"name": "xpspeak_status", "arguments": {"mode": "teach"}})
+    st2 = rpc("tools/call", {"name": "xpspeak_status", "arguments": {}})["result"]["content"][0]["text"]
+    assert "教学模式" in st2, st2                      # 只读调用在教学模式下照常可用
+    tr = rpc("tools/call", {"name": "xpspeak_click", "arguments": {"caption": "Open XPS"}})
+    ttxt = tr["result"]["content"][0]["text"]
+    assert tr["result"].get("isError") and "教学模式" in ttxt and "请你操作" in ttxt, tr
+    assert "Open XPS" in ttxt, ttxt                    # 拒绝里要写清「你自己该点哪个」
+    assert not D.dialogs(pid_val), "教学模式竟然点出了对话框: %r" % [D.text(h) for h in D.dialogs(pid_val)]
+    tr2 = rpc("tools/call", {"name": "xpspeak_menu", "arguments": {"top": "Add Peak"}})
+    assert tr2["result"].get("isError") and "教学模式" in tr2["result"]["content"][0]["text"], tr2
+    rpc("tools/call", {"name": "xpspeak_status", "arguments": {"mode": "exec"}})
+
     if owned:
         cr = rpc("tools/call", {"name": "xpspeak_close", "arguments": {"pid": pid_val}})
         assert "已关闭" in cr["result"]["content"][0]["text"], cr

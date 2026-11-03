@@ -1,6 +1,6 @@
 ---
 name: xpspeak-automation
-description: 用 AI/脚本控制 XPSPeak 4.1（XPSPEAK41.exe，XPS 分峰软件）——Win32 消息级自动化 + 自带 MCP server，可装到新电脑、载入谱图、加分峰/扣背景/优化、导出数据与原生 .xps/.rpa。触发词：XPSPeak / XPSPEAK41 / XPS 分峰 / 控制 XPS Peak / 把 XPS 分峰装到别的电脑 / 让 AI 操作 XPS 分峰软件。
+description: 用 AI/脚本控制 XPSPeak 4.1（XPSPEAK41.exe，XPS 分峰软件）——Win32 消息级自动化 + 自带 MCP server，可装到新电脑、载入谱图、加分峰/扣背景/优化、导出数据与原生 .xps/.rpa。两档：教学模式（只读讲解，不替你点）与代执行（授权范围内一次做完）。触发词：XPSPeak / XPSPEAK41 / XPS 分峰 / 控制 XPS Peak / 把 XPS 分峰装到别的电脑 / 让 AI 操作 XPS 分峰软件 / 教我 XPSPeak / 带我走一遍 XPSPeak。
 ---
 
 # XPSPeak 4.1 自动化：怎么控制它 + 怎么装到别的电脑
@@ -9,6 +9,44 @@ description: 用 AI/脚本控制 XPSPeak 4.1（XPSPEAK41.exe，XPS 分峰软件�
 
 - `xpspeak_mcp.py` — MCP server（stdio，9 个工具），任何 MCP 客户端（DSH / Claude Code / Cursor…）都能调
 - `xpspeak_drive.py` — 底层 Win32 消息驱动，也可以**不装 MCP 直接用命令行跑**
+
+---
+
+## 〇、两档模式：教学 / 代执行（先判档，再动手）
+
+| 用户说 | 档位 |
+|---|---|
+| 「教我 / 带我走一遍 / 我想学 / 这一步在哪」 | **教学模式** |
+| 「你来做 / 帮我处理完 / 直接出结果」 | **代执行** |
+| 没说清 | **先问一句**，别猜 |
+
+切换用 `xpspeak_status(mode="teach"|"exec")`，当前档会写进每次 status 返回。**用户说「你来吧」才切代执行，切的时候先用一句话复述授权范围再动手。**
+
+### 教学模式铁律（服务端硬拦，不靠自觉）
+
+1. **一次只给一小步**：这一步在哪个窗口、哪个菜单、哪个控件；目的是什么；做完怎么判断对了。
+2. **说完就停**：等用户回 `done` 或发截图，**不许连续播下一步**。
+3. **不许代替用户点击/输入**。教学模式下调 `xpspeak_open / xpspeak_export / xpspeak_save / xpspeak_menu / xpspeak_click / xpspeak_close / xpspeak_build` 会被服务端直接拒绝（`isError` +「教学模式：不替你点按钮 —— 这一步请你操作」+ 具体该点哪里），这是硬拦截，不是提示。
+   - 允许的是**只读**：`xpspeak_status`（读进程/窗体/菜单/当前值）、`xpspeak_fit`（纯数值拟合，不碰界面）。**「看」不等于「做」**。
+4. **截图只支持可见结论**：截图里读不出的参数值/文件内容，去查项目文件或导出数据，别猜。
+5. **卡住超过一轮还没进展** → 主动问「要不要切到代执行模式」。
+
+### 代执行模式
+
+在**用户授权范围内**一次做完，不逐步重复索要许可；但开头要把范围说清楚（哪些文件、哪些谱、能不能覆盖原工程）。中途要扩大范围（换文件、覆盖原 `.xps`、批量跑多张谱）**先问再动**。
+
+### 五段回复格式（凡给结论/建议）
+
+| 段 | 写什么 | 不合格的样子 |
+|---|---|---|
+| 1 当前证据 | 实测值 / 读回值 / `文件:行号` | 「看起来峰偏宽」 |
+| 2 改什么 | 具体动作或建议值 | 「调一下参数」 |
+| 3 为什么 | 机制 / 原理 | 「经验上这样好」 |
+| 4 依据 | 本 SKILL 行号 / 软件行为 / 实测记录 | 「一般来说」 |
+| 5 如何判定 | 改完怎么证明对了：一条命令或一个读数 | 「应该会好一些」 |
+
+**五段缺一段 → 该结论降级为「未验证」，不许当结论用。**
+教学模式下这五段就是每一步的骨架：位置（当前证据）→ 目的与原理（为什么）→ 判据（如何判定）。
 
 ---
 
@@ -92,7 +130,7 @@ MCP 配置**必须重启客户端才生效**。重启后先调 `xpspeak_status`�
 |---|---|---|
 | `xpspeak_fit` | 带约束双线拟合，不启动 GUI | `path`；`centers`（各组分主峰初值 eV）；`bg`=file/linear/shirley/none；`ds`（劈裂 ΔBE）；`ratio`（伴线面积比）；`eta`（%L）；`ctol`/`wlo`/`whi`/`hmax`（边界，默认 1.0/0.6/4.0/120000）；`window`（拟合窗口 [lo,hi] eV，Shirley 端点按窗口重取）；`scan`（扫 1..N 条模型）；`csv` |
 | `xpspeak_build` | 一次调用生成 .xps（载谱→扣背景→逐个 Add Peak→导出→Save XPS，并回读复核面积） | `path`；`peaks`=[{pos,fwhm,area,gl}]；`out`（.xps）；`spec`/`par`（可选导出）；`bg` |
-| `xpspeak_status` | 启动并返回 pid、窗体、按钮、全部菜单项。**任何操作前先调它** | — |
+| `xpspeak_status` | 启动并返回 pid、窗体、按钮、全部菜单项、当前模式。**任何操作前先调它**；也是切模式的入口 | `mode`=teach/exec（省略=只读当前模式） |
 | `xpspeak_open` | 载入谱图 | `path`；`source`=auto/xps/ascii（auto 按扩展名：.xps/.rpa 走 Open XPS，其余走 Import (ASCII)） |
 | `xpspeak_export` | 导出数据 | `path`；`what`=spectrum（B.E./Raw/Peak Sum/Background/各峰/difference）或 peaks（峰参数表） |
 | `xpspeak_save` | 存原生文件 | `path`；`what`=xps（谱图+背景+已定峰，可被 open 原样载回）或 rpa（只存区域峰参数，可套到别的谱） |

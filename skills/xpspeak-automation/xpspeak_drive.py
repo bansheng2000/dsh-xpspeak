@@ -20,7 +20,7 @@ import ctypes, itertools, os, re, subprocess, sys, time, shutil
 from ctypes import wintypes as w
 
 u = ctypes.windll.user32
-__version__ = "1.2.1"        # 与仓库 tag 同步；MCP 的 serverInfo.version 读这里，别再各写一个
+__version__ = "1.2.2"        # 与仓库 tag 同步；MCP 的 serverInfo.version 读这里，别再各写一个
 EXE_DEFAULT = r"E:\下载\XPS分峰软件XPSpeak41\XPS分峰软件XPSpeak41\XPSPEAK41.exe"
 WORKDIR = os.path.join(os.path.expanduser("~"), "xpspeak_auto")
 _SEQ = itertools.count(1)    # work_path 的唯一后缀

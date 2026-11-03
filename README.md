@@ -6,6 +6,13 @@
 - 走 **Win32 消息级自动化**（按菜单文字取 id → `PostMessage WM_COMMAND`），不抢鼠标、不抢前台焦点、和 DPI/分辨率无关
 - 自带 MCP server（stdio，9 个工具），DSH / Claude Code / Cursor 等任何 MCP 客户端都能用；也可以不装 MCP 直接命令行跑
 
+## 两档模式：教你 / 替你做
+
+- **教学模式**（用户说「教我 / 带我走一遍 / 我想学」）：一次只讲一小步（位置 → 目的 → 判据），讲完就停等 `done`；**服务端硬拦所有会改界面的调用** —— `open / export / save / menu / click / close / build` 直接返回拒绝 +「这一步请你操作」，只读的 `xpspeak_status` 与纯计算的 `xpspeak_fit` 照常可用。
+- **代执行**（用户说「你来做 / 帮我处理完」）：在授权范围内一次做完；范围（哪些文件、哪些谱、能不能覆盖原工程）先说清，中途扩大范围先问。档位没说清就先问一句。
+- 切换：`xpspeak_status(mode="teach"|"exec")`；用户说「你来吧」才切代执行，切换时先复述授权范围。
+- 凡给结论都按五段：**当前证据 → 改什么 → 为什么 → 依据 → 如何判定**；缺一段即降级为「未验证」。
+
 ## 文件
 
     install.py                                   一键装：拷文件 + 自动找 XPSPEAK41.exe + 打印 mcpServers JSON
